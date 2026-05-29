@@ -1,0 +1,28 @@
+# Layer 1 — Traffic Disruption Intelligence
+# Install with: pip install -r req.txt
+# Tested on Python 3.14 (macOS arm64)
+
+# Routing & mapping
+osmnx==2.1.0
+geopy==2.4.1
+
+# LangChain
+langchain==1.3.1
+langchain-core==1.4.0
+langchain-openai==1.2.2       # ChatOpenAI → OpenRouter
+langchain-google-genai==4.2.3 # ChatGoogleGenerativeAI → Gemini fallback
+
+# LLM API clients (pulled in by LangChain integrations above)
+openai==2.38.0
+google-generativeai==0.8.6
+ollama==0.6.2
+
+# Data ingestion
+requests==2.34.2
+feedparser==6.0.12
+
+# Database
+sqlalchemy==2.0.50
+
+# Config / env
+python-dotenv==1.2.2

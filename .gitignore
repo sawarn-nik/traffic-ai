@@ -1,0 +1,54 @@
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
+.env
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Database (generated at runtime) ──────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── OSM graph cache (large binary, regenerated on first run) ─────────────────
+app/cache/graph.graphml
+cache/graph.graphml
+
+# ── OSMnx / requests JSON caches ─────────────────────────────────────────────
+app/cache/*.json
+cache/*.json
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Build artifacts ───────────────────────────────────────────────────────────
+.dist/
