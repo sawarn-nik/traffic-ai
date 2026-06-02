@@ -2,34 +2,79 @@
 
 **A Probabilistic and Explainable Tool for Context-Aware Multimodal Trip Planning Using Generative AI**
 
-Research prototype for the ANRF ARG grant proposal — IIT Kharagpur.  
+Research prototype — ANRF ARG grant proposal, IIT Kharagpur.  
 Pilot city: **Kolkata, India** | Collaboration with Kolkata Traffic Police.
 
 ---
 
-## What this does
+## What it does
 
-Current trip planners are reactive — they only know about disruptions after they happen.  
-This system is **anticipatory**: it reads unstructured sources (news, social media, public advisories) in real time, extracts structured disruption events using an LLM, and scores your route before you travel.
+Current trip planners are reactive — they only know about a disruption after sensors detect it.  
+This system is **anticipatory**: it reads news, public advisories, and live traffic feeds *before* you travel, extracts structured disruption events using an LLM, and scores your route in real time.
 
 ```
-You enter: Howrah Station → Salt Lake Sector V
+You pick:  Howrah Station  →  Salt Lake Sector V
 
 System:
-  1. Computes driving route on Kolkata OSM graph
-  2. Fetches news articles for each road segment + city-wide Kolkata feeds
-  3. LLM extracts: event type, location, severity (σ), confidence (κ), future flag
-  4. Scores route risk = Σ(σ × κ) across all recent events
-  5. Prints disruption summary with HIGH / MODERATE / LOW risk verdict
+  Step 1 (instant ~2s)  — Computes 2–3 alternative routes on Kolkata road graph
+  Step 2 (background)   — Fetches Google News RSS + NewsAPI + TomTom Live incidents
+                         — LLM extracts event_type, location, severity σ, confidence κ
+                         — Scores each route: risk = Σ(σ × κ) for recent events
+                         — Updates map with colour-coded routes + disruption markers
 ```
 
-This is **Layer 1** of a 3-layer system described in the proposal:
+**The map draws immediately. Disruption analysis fills in the background.**
 
-| Layer | Description | Status |
-|-------|-------------|--------|
-| **1** | LLM-based disruption intelligence (this repo) | ✅ Working |
-| **2** | Bayesian probabilistic data fusion | 🔲 Planned |
-| **3** | Risk-aware multimodal routing (CVaR) + explainability UI | 🔲 Planned |
+---
+
+## Quickstart
+
+### 1. Clone
+
+```bash
+git clone https://github.com/sawarn-nik/traffic-ai.git
+cd traffic-ai
+```
+
+### 2. Python environment
+
+```bash
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r req.txt
+```
+
+### 3. API keys
+
+```bash
+cp .env.example .env
+# Open .env and fill in your keys
+```
+
+| Key | Where to get | Required? |
+|-----|-------------|-----------|
+| `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) — free, no card | ✅ Yes (or Gemini) |
+| `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com/app/apikey) — free | ✅ Yes (or OpenRouter) |
+| `TOMTOM_API_KEY` | [developer.tomtom.com](https://developer.tomtom.com) — free, no card | ⭐ Recommended |
+| `NEWS_API_KEY` | [newsapi.org/register](https://newsapi.org/register) — 100 req/day free | Optional |
+
+You need **at least one** of OpenRouter or Gemini for LLM extraction.
+
+### 4. Start the server
+
+```bash
+cd app
+uvicorn api:app --port 8000 --reload
+```
+
+### 5. Open the map
+
+```
+http://localhost:8000
+```
+
+Select source and destination → click **Get Routes**.  
+Routes appear on the map within ~2 seconds. Disruption analysis populates in the background (~30–60 seconds).
 
 ---
 
@@ -38,127 +83,95 @@ This is **Layer 1** of a 3-layer system described in the proposal:
 ```
 traffic-ai/
 ├── app/
-│   ├── main.py                  # Entry point — run this
+│   ├── api.py                   # FastAPI server — run this with uvicorn
+│   ├── main.py                  # CLI pipeline (optional, for debugging)
 │   ├── config.py                # All settings, reads from .env
+│   ├── static/
+│   │   └── index.html           # Leaflet.js map frontend (single file)
 │   ├── ingestion/
-│   │   ├── rss_fetcher.py       # Google News RSS + Kolkata-specific feeds
-│   │   ├── news_fetcher.py      # NewsAPI integration
-│   │   └── twitter_fetcher.py   # Twitter/X (requires paid API)
+│   │   ├── rss_fetcher.py       # Google News RSS (when:2d Kolkata feeds)
+│   │   ├── news_fetcher.py      # NewsAPI
+│   │   ├── tomtom_fetcher.py    # TomTom Traffic Incidents API (live)
+│   │   └── weather_fetcher.py   # OpenWeatherMap (optional)
 │   ├── llm/
-│   │   ├── extractor.py         # LangChain chain + retry logic
-│   │   ├── prompts.py           # Kolkata-tuned system prompt
-│   │   ├── schema.py            # Pydantic output schema (σ, κ, event fields)
-│   │   └── parser.py            # Compatibility shim
+│   │   ├── extractor.py         # LangChain LCEL chain + JSON repair + retry
+│   │   ├── prompts.py           # Kolkata-tuned system + location-retry prompts
+│   │   ├── schema.py            # TrafficEventSchema (Pydantic)
+│   │   ├── filter.py            # Pre/post LLM filtering and deduplication
+│   │   └── location_resolver.py # Location resolution and enrichment
 │   ├── routing/
-│   │   ├── route_engine.py      # OSMnx routing, Kolkata graph cache
-│   │   └── geocoder.py          # Nominatim geocoding
+│   │   ├── route_engine.py      # OSMnx routing + multi-route + GeoJSON export
+│   │   └── cost_function.py     # Layer 3 placeholder (Eq. 3)
 │   ├── scoring/
-│   │   └── congestion_score.py  # σ × κ weighted score
+│   │   ├── congestion_score.py  # σ × κ weighted score
+│   │   ├── confidence.py        # Enhanced multi-factor confidence scoring
+│   │   └── impact_duration.py   # Event duration estimation
+│   ├── fusion/
+│   │   └── bayesian_fusion.py   # Layer 2 placeholder (Eq. 1)
 │   ├── database/
 │   │   └── models.py            # SQLAlchemy — traffic_events.db
 │   └── utils/
 │       └── helpers.py           # Text cleaning, dedup, timestamps
-├── data/                        # Datasets (add yours here, not committed)
-├── notebooks/                   # Jupyter notebooks for analysis
-├── .env.example                 # Copy to .env and fill in your keys
+├── docs/
+│   └── project-handoff.md       # Full technical handoff for teammates
+├── data/                        # Datasets (not committed)
+├── notebooks/                   # Jupyter analysis notebooks
+├── .env.example                 # Template — copy to .env
+├── .gitignore
 ├── req.txt                      # Python dependencies
 └── README.md
 ```
 
 ---
 
-## Quickstart
+## How routes are scored
 
-### 1. Clone and set up environment
-
-```bash
-git clone https://github.com/YOUR_ORG/traffic-ai.git
-cd traffic-ai
-
-python3 -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
-
-pip install -r req.txt
 ```
+severity_score σ:   low=2  medium=5  high=10
+confidence κ:       0.0–1.0  (LLM certainty about the extraction)
+weighted_score:     σ × κ
 
-### 2. Configure API keys
+route_risk = Σ(weighted_score) for all recent events on route
 
-```bash
-cp .env.example .env
-# Edit .env and add your keys (see comments inside for where to get them)
+risk levels:
+  CRITICAL  ≥ 25   (deep purple)
+  HIGH      ≥ 12   (red)
+  MODERATE  ≥ 5    (orange)
+  LOW       > 0    (yellow-green)
+  CLEAR     = 0    (green)
+
+best route = lowest  travel_time × (1 + risk_score / 10)
 ```
-
-Minimum required: one of `OPENROUTER_API_KEY` or `GEMINI_API_KEY`.  
-`NEWS_API_KEY` is optional but improves article coverage.
-
-### 3. Run
-
-```bash
-cd app
-python3 main.py
-```
-
-You'll be prompted:
-```
-  Source      : Howrah Station
-  Destination : Salt Lake Sector V
-```
-
-The Kolkata OSM graph downloads once (~30s) and is cached for all future runs.
 
 ---
 
-## Configuration
+## Layers
 
-All settings live in `.env`. Key options:
+| Layer | Description | Status |
+|-------|-------------|--------|
+| **1** | LLM disruption intelligence — this repo | ✅ Complete |
+| **2** | Bayesian probabilistic data fusion | 🔲 Planned |
+| **3** | CVaR risk-aware routing + explainability | 🔲 Planned |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENROUTER_API_KEY` | — | Primary LLM backend (free tier available) |
-| `GEMINI_API_KEY` | — | Fallback LLM backend |
-| `NEWS_API_KEY` | — | NewsAPI for supplementary articles |
-| `OPENROUTER_MODEL` | `openai/gpt-oss-20b:free` | Swap model without code changes |
-| `DEFAULT_CITY` | `Kolkata, India` | City for OSM graph + geocoding |
-| `DATABASE_URL` | `sqlite:///traffic_events.db` | Where events are stored |
-
----
-
-## Branches and contribution workflow
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
-
-| Branch | Purpose |
-|--------|---------|
-| `main` | Stable, always runnable |
-| `dev` | Integration branch — PRs merge here first |
-| `feature/layer2-bayesian-fusion` | Layer 2 work |
-| `feature/layer3-routing` | Layer 3 CVaR routing |
-| `feature/ui-dashboard` | Browser dashboard |
+See [docs/project-handoff.md](docs/project-handoff.md) for full technical details.
 
 ---
 
 ## Team
 
-| Member | Area |
+| Member | Role |
 |--------|------|
-| Nikhil | Layer 1 (LLM pipeline) — repo owner |
-| TBD | Layer 2 (Bayesian fusion) |
-| TBD | Layer 3 (routing + CVaR) |
-| TBD | UI / dashboard |
+| Nikhil Kumar | Layer 1 — LLM pipeline, routing, frontend |
+| TBD | Layer 2 — Bayesian fusion |
+| TBD | Layer 3 — CVaR routing |
+| TBD | UI / dashboard extensions |
 
 ---
 
 ## Research context
 
-This prototype implements the proof-of-concept described in:
-
 > *A Probabilistic and Explainable Tool for Context-Aware Multimodal Trip Planning Using Generative Artificial Intelligence (GenAI)*  
 > ANRF ARG Pre-Proposal, IIT Kharagpur, 2026
-
-Key equations implemented:
-- **Eq. 1** — Bayesian posterior disruption probability π_e^post(t) *(Layer 2, planned)*
-- **Eq. 3** — Generalized edge cost c_e(t) with σ, κ, CO₂, transfer penalties *(Layer 3, planned)*
-- **σ × κ weighted score** — current Layer 1 proxy for disruption signal strength
 
 ---
 

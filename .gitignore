@@ -52,3 +52,9 @@ logs/
 
 # ── Build artifacts ───────────────────────────────────────────────────────────
 .dist/
+app.zip
+app_old/
+
+# ── OSMnx pickle cache ────────────────────────────────────────────────────────
+app/cache/*.pkl
+cache/*.pkl

@@ -1,141 +1,142 @@
 # Contributing to traffic-ai
 
-This document is for the 4-person team working on this project.  
-Read it once before you write a single line of code.
+Read this before writing any code. It covers setup, branching, commits, and what each layer needs to build.
 
 ---
 
-## 1. Branch strategy
-
-```
-main
- └── dev                              ← everyone merges into here
-      ├── feature/layer2-bayesian-fusion
-      ├── feature/layer3-routing
-      ├── feature/ui-dashboard
-      └── fix/some-bug-description
-```
-
-**Rules:**
-- `main` is protected. No direct pushes. Only merges from `dev` after review.
-- `dev` is the shared integration branch. All feature branches branch off `dev`.
-- Never work directly on `main` or `dev`.
-- Branch names: `feature/short-description` or `fix/short-description`.
-
----
-
-## 2. Daily workflow
+## 1. First-time setup
 
 ```bash
-# Start of day — sync your branch with latest dev
-git checkout dev
-git pull origin dev
-git checkout your-feature-branch
-git rebase dev                  # keeps history clean
-
-# Work, commit often with clear messages
-git add app/llm/extractor.py
-git commit -m "feat(extractor): add exponential backoff on 429 errors"
-
-# Push and open a PR into dev (not main)
-git push origin your-feature-branch
-```
-
----
-
-## 3. Commit message format
-
-Use this format — it makes the git log readable for everyone:
-
-```
-type(scope): short description
-
-Optional longer explanation if needed.
-```
-
-| Type | When to use |
-|------|-------------|
-| `feat` | New feature or capability |
-| `fix` | Bug fix |
-| `refactor` | Code restructure, no behaviour change |
-| `docs` | README, comments, docstrings |
-| `test` | Adding or fixing tests |
-| `chore` | Dependency updates, config changes |
-
-**Examples:**
-```
-feat(rss_fetcher): add Kolkata Police feed and age-label parsing
-fix(extractor): handle empty structured-output response from gpt-oss-20b
-docs(readme): add quickstart section
-refactor(route_engine): extract geocoding into _geocode_with_context()
-```
-
----
-
-## 4. Pull request checklist
-
-Before opening a PR into `dev`:
-
-- [ ] Code runs without errors (`python3 app/main.py`)
-- [ ] No API keys or secrets in any file
-- [ ] `.env` is NOT committed (check `git status`)
-- [ ] New functions have docstrings
-- [ ] PR description explains *what* changed and *why*
-- [ ] At least one other team member reviews before merge
-
----
-
-## 5. Who owns what
-
-| Layer | Branch | Owner | Description |
-|-------|--------|-------|-------------|
-| Layer 1 | `main` / `dev` | Nikhil | LLM disruption extraction — **done** |
-| Layer 2 | `feature/layer2-bayesian-fusion` | TBD | Bayesian fusion of structured + LLM signals |
-| Layer 3 | `feature/layer3-routing` | TBD | CVaR routing, generalized edge cost |
-| UI | `feature/ui-dashboard` | TBD | Browser dashboard, map visualization |
-
----
-
-## 6. Setting up your local environment
-
-```bash
-git clone https://github.com/YOUR_ORG/traffic-ai.git
+git clone https://github.com/sawarn-nik/traffic-ai.git
 cd traffic-ai
 
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 
 pip install -r req.txt
 
 cp .env.example .env
-# Edit .env — add your own API keys (ask Nikhil for the shared dev keys)
+# Fill in your API keys — ask Nikhil for the shared dev set
 ```
 
-**Never share API keys over WhatsApp/email. Use the shared .env in the team password manager or ask directly.**
+**Never commit `.env`.** It's in `.gitignore`. Keys go in `.env` only.
+
+---
+
+## 2. Running the project
+
+```bash
+cd app
+uvicorn api:app --port 8000 --reload
+# Open http://localhost:8000
+```
+
+`main.py` is the old CLI version — use it only for quick debugging without the browser.
+
+---
+
+## 3. Branch strategy
+
+```
+main   ← stable, protected — no direct pushes
+ └── dev  ← everyone merges here
+      ├── feature/layer2-bayesian-fusion   (Teammate A)
+      ├── feature/layer3-routing           (Teammate B)
+      ├── feature/ui-extensions            (Teammate C)
+      └── fix/short-description
+```
+
+**Rules:**
+- Branch off `dev`, merge back into `dev` via PR
+- Never push directly to `main` or `dev`
+- `main` only updated by merging `dev` after team review
+
+---
+
+## 4. Daily workflow
+
+```bash
+# Sync with latest dev
+git checkout dev
+git pull origin dev
+git checkout your-feature-branch
+git rebase dev
+
+# Work and commit
+git add app/your_file.py
+git commit -m "feat(scope): what you did"
+
+# Push to both repos at once
+git push
+```
+
+---
+
+## 5. Commit message format
+
+```
+feat(extractor): add JSON repair for malformed LLM output
+fix(rss_fetcher): scope queries to when:2d for recency
+refactor(route_engine): extract bounds check into helper
+docs(readme): update quickstart for uvicorn
+chore(deps): add fastapi and uvicorn to req.txt
+```
+
+| Prefix | When to use |
+|--------|-------------|
+| `feat` | New feature |
+| `fix` | Bug fix |
+| `refactor` | Restructure without behaviour change |
+| `docs` | Docs, comments, docstrings |
+| `chore` | Dependencies, config, tooling |
+
+---
+
+## 6. PR checklist
+
+- [ ] `uvicorn api:app --port 8000` starts without errors
+- [ ] No `.env` file in the diff (`git status` should not show it)
+- [ ] No API keys anywhere in the code
+- [ ] New functions have docstrings
+- [ ] PR description explains what changed and why
 
 ---
 
 ## 7. What NOT to commit
 
-These are already in `.gitignore` but worth knowing:
-
-| File/folder | Why |
-|-------------|-----|
-| `.env` | Contains API keys |
-| `venv/` | 200MB+ of packages, everyone installs their own |
-| `*.db` | Generated at runtime, different on each machine |
-| `app/cache/graph.graphml` | 50MB+ OSM graph, downloads automatically |
-| `app/cache/*.json` | OSMnx request cache, machine-specific |
-| `__pycache__/` | Python bytecode, auto-generated |
-| `.DS_Store` | macOS metadata, useless to others |
+| File/folder | Reason |
+|-------------|--------|
+| `.env` | API keys |
+| `venv/` | ~200MB, everyone installs their own |
+| `*.db` | Generated at runtime |
+| `app/cache/graph.graphml` | ~50MB OSM graph, auto-downloaded |
+| `app/cache/*.json` | OSMnx cache, machine-specific |
+| `__pycache__/` | Python bytecode |
+| `.DS_Store` | macOS metadata |
 
 ---
 
-## 8. Layer 2 and 3 — what to build next
+## 8. Two remotes — one push
 
-### Layer 2: Bayesian Fusion (`feature/layer2-bayesian-fusion`)
+Your local repo pushes to both the personal repo and the team repo simultaneously:
 
-The goal is to implement Equation 1 from the proposal:
+```bash
+git remote -v
+# origin  https://github.com/sawarn-nik/traffic-ai.git (fetch)
+# origin  https://github.com/sawarn-nik/traffic-ai.git (push)
+# origin  https://github.com/lakshya1729git/IIT_kgp_internship.git (push)
+```
+
+One `git push` → both repos updated. No extra steps.
+
+---
+
+## 9. Layer 2 — Bayesian Fusion
+
+**File:** `app/fusion/bayesian_fusion.py` (placeholder with spec)  
+**Branch:** `feature/layer2-bayesian-fusion`
+
+Implement Eq. 1 from the proposal:
 
 ```
 π_e^post(t) = p(S | Z_e=1) × π_e^prior(t)
@@ -143,38 +144,41 @@ The goal is to implement Equation 1 from the proposal:
               Σ p(S | Z_e=z) × π_e^prior(t)
 ```
 
-**Inputs available from Layer 1 (already in `traffic_events.db`):**
+**Inputs** already in `traffic_events.db`:
 - `severity_score` → σ(t)
-- `confidence` → κ(t)  
+- `confidence` → κ(t)
 - `road_name`, `event_type`, `is_future_event`, `fetched_at`
 
-**What to build:**
-- `app/fusion/bayesian_fusion.py` — reads Layer 1 DB, computes posterior per road segment
-- Prior π_prior from GTFS-RT or a simple time-of-day baseline
-- Output: per-edge disruption probability for the routing layer
+**Output:** `dict[road_name → posterior_probability ∈ [0,1]]`  
+This feeds into Layer 3's edge cost function.
 
-### Layer 3: Risk-Aware Routing (`feature/layer3-routing`)
-
-Implement Equation 3 (generalized edge cost):
-
-```
-c_e(t) = c_base(t) + λ1·E[τ̃] + λ2·Var[τ̃] + λ3·κ·σ + λ4·CO2 + λ5·Transfers
-```
-
-**What to build:**
-- `app/routing/cost_function.py` — generalized edge cost
-- `app/routing/cvar_router.py` — CVaR-based path optimization
-- Integrate with Layer 2 posterior probabilities
-
-### UI Dashboard (`feature/ui-dashboard`)
-
-- FastAPI backend serving route + disruption data as JSON
-- Simple HTML/JS frontend with Leaflet.js map
-- Color-coded route legs by disruption severity
-- Explanation panel: "Why this route?"
+**Prior:** start with a simple time-of-day baseline (peak hours = 0.2, off-peak = 0.05), refine with historical DB rates later.
 
 ---
 
-## 9. Questions?
+## 10. Layer 3 — Risk-Aware Routing
 
-Open a GitHub Issue with the label `question`. Don't use WhatsApp for code discussions — keep everything on GitHub so it's searchable.
+**File:** `app/routing/cost_function.py` (placeholder with spec)  
+**Branch:** `feature/layer3-routing`
+
+Implement Eq. 3:
+
+```
+c_e(t) = c_base(t)
+       + λ1·E[τ̃_e(t)]     ← expected travel time
+       + λ2·Var[τ̃_e(t)]    ← reliability
+       + λ3·κ·σ             ← disruption risk
+       + λ4·CO2(e)          ← emissions
+       + λ5·Transfers(e)    ← mode-switch penalty
+```
+
+Files to build:
+- `app/routing/cost_function.py` — generalized edge cost
+- `app/routing/cvar_router.py` — CVaR path optimization
+- `app/routing/travel_time.py` — travel time distributions
+
+---
+
+## 11. Questions
+
+Open a GitHub Issue with label `question`. Keep code discussions on GitHub, not WhatsApp — it's searchable and archived.

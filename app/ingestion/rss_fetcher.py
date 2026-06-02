@@ -20,6 +20,45 @@ from datetime import datetime, timezone, timedelta
 from utils.helpers import clean_html
 
 
+# ── Real URL extraction ───────────────────────────────────────────────────────
+
+def _get_real_url(entry) -> str:
+    """
+    Extract the real article URL from a Google News RSS entry.
+
+    Google News RSS entries contain the publisher's article URL in the
+    <source> tag's href attribute. The entry.link is an encoded Google
+    News redirect URL that cannot be reliably decoded without JavaScript.
+
+    Strategy (in order of reliability):
+      1. entry.source.href — publisher URL embedded in <source> tag
+      2. entry.links[]     — any non-google.com link in the links list
+      3. entry.link        — fallback to the encoded Google News URL
+
+    Args:
+        entry: A feedparser entry object
+
+    Returns:
+        The best available URL string (real publisher URL when possible).
+    """
+    # Method 1: source.href contains the publisher's article URL
+    source = getattr(entry, "source", None)
+    if source:
+        # feedparser may expose it as an attribute or dict-like
+        href = getattr(source, "href", "") or (source.get("href", "") if hasattr(source, "get") else "")
+        if href and "google.com" not in href and href.startswith("http"):
+            return href
+
+    # Method 2: check links list for a non-Google URL
+    for link in getattr(entry, "links", []):
+        href = link.get("href", "")
+        if href and "google.com" not in href and href.startswith("http"):
+            return href
+
+    # Method 3: fall back to entry.link (encoded Google News URL)
+    return entry.get("link", "")
+
+
 # ── Date helpers ──────────────────────────────────────────────────────────────
 
 def _parse_published(entry) -> datetime | None:
@@ -130,16 +169,19 @@ def fetch_rss(feed_key: str = "kolkata_traffic", max_items: int = 10) -> list[di
 
         articles = []
         for entry in feed.entries[:max_items]:
-            pub_dt = _parse_published(entry)
+            pub_dt   = _parse_published(entry)
+            real_url = _get_real_url(entry)
             articles.append({
-                "title":        clean_html(entry.get("title", "")),
-                "description":  clean_html(entry.get("summary", "")),
-                "link":         entry.get("link", ""),
-                "published":    entry.get("published", ""),
-                "published_dt": pub_dt,           # datetime | None
-                "age_label":    _age_label(pub_dt),
-                "is_recent":    _is_recent(pub_dt),
-                "source":       feed_key,
+                "title":           clean_html(entry.get("title", "")),
+                "description":     clean_html(entry.get("summary", "")),
+                "link":            real_url,            # real article URL (or best available)
+                "source_url":      real_url,            # alias for display
+                "google_news_url": entry.get("link", ""),  # original encoded Google News URL
+                "published":       entry.get("published", ""),
+                "published_dt":    pub_dt,              # datetime | None
+                "age_label":       _age_label(pub_dt),
+                "is_recent":       _is_recent(pub_dt),
+                "source":          feed_key,
             })
 
         print(f"  [RSS] Got {len(articles)} articles from {feed_key}")

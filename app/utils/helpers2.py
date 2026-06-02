@@ -2,7 +2,6 @@ import re
 import os
 import json
 from datetime import datetime
-from typing import Optional
 
 
 # ── Text utilities ────────────────────────────────────────────────────────────
@@ -64,54 +63,3 @@ def deduplicate(items: list[dict], key: str) -> list[dict]:
             seen.add(val)
             result.append(item)
     return result
-
-
-# ── Google News URL resolver ──────────────────────────────────────────────────
-
-def resolve_article_url(url: str, use_redirect: bool = False) -> str:
-    """
-    For Google News RSS URLs: the real article URL should be captured at
-    fetch time from entry.source.href (see rss_fetcher._get_real_url).
-    This function is a no-op fallback for when we only have the encoded link.
-
-    Google News RSS encoded URLs (news.google.com/rss/articles/CBMi...)
-    cannot be reliably decoded without JavaScript rendering or the gnews
-    package. The correct approach is to read entry.source.href at fetch time.
-
-    Args:
-        url:          The URL to resolve (may be encoded Google News URL)
-        use_redirect: Ignored — kept for API compatibility
-
-    Returns:
-        The original URL unchanged. Real URLs are captured at fetch time.
-    """
-    if not url or "news.google.com" not in url:
-        return url
-    # Can't reliably decode Google News URLs without JavaScript rendering.
-    # The real URL is captured at fetch time from entry.source.href.
-    return url
-
-
-def resolve_article_urls_batch(
-    articles: list[dict],
-    url_key: str = "url",
-    use_redirect: bool = False,
-) -> list[dict]:
-    """
-    Resolve Google News URLs for a batch of articles in-place.
-
-    Adds a 'article_url' key with the resolved real URL.
-    The original 'url' key is preserved unchanged.
-
-    Args:
-        articles:     List of article dicts
-        url_key:      Key containing the URL to resolve (default: 'url')
-        use_redirect: Ignored — kept for API compatibility
-
-    Returns:
-        The same list with 'article_url' added to each dict.
-    """
-    for article in articles:
-        raw_url = article.get(url_key, "")
-        article["article_url"] = resolve_article_url(raw_url, use_redirect)
-    return articles

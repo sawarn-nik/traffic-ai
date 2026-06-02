@@ -1,125 +1,424 @@
 """
-route_engine.py — OSMnx-based routing for Kolkata
+route_engine.py — OSMnx-based routing for Kolkata + North suburbs
 
-Graph is downloaded once and cached to disk as a GraphML file so
-subsequent runs don't re-download the full city network.
+Downloads the road network by named administrative places rather than a
+bounding box. This avoids the Overpass "area too large" subdivision
+problem while still covering all 15 menu localities.
 
-get_route() geocodes source/destination with Kolkata as the city
-context so short locality names like "Park Street" or "Salt Lake"
-resolve correctly without the user having to type the full address.
+Places covered:
+  - Kolkata              (core city — Howrah bridge to Jadavpur/Behala)
+  - Bidhannagar          (Salt Lake Sector V + New Town + Rajarhat)
+  - North Dum Dum        (Dum Dum corridor, airport area)
+  - Barasat              (northernmost menu locality)
+
+WHY graph_from_place INSTEAD OF graph_from_bbox:
+  A bounding box large enough to cover Barasat (~22.72 N) triggers
+  Overpass's area-subdivision warning (13,000+ sub-queries) because
+  the projected area exceeds the server's per-query limit. Named
+  administrative polygons are small and well-defined — each is sent
+  as a single compact Overpass query with no subdivision.
+
+WHY PICKLE:
+  Pickle serialises the Python object directly — no XML parsing,
+  loads in ~2 seconds, uses ~3x less peak memory than GraphML.
 """
 
 import os
+import pickle
+import math
 import osmnx as ox
 
-from config import DEFAULT_CITY, GRAPH_CACHE_PATH
+from config import GRAPH_CACHE_PATH
+
+
+# ── Named places that together cover all 15 menu localities ──────────────────
+GRAPH_PLACES = [
+    "Kolkata, West Bengal, India",
+    "Bidhannagar, West Bengal, India",    # Salt Lake + New Town + Rajarhat
+    "North Dum Dum, West Bengal, India",  # Dum Dum corridor
+    "Barasat I, West Bengal, India",      # Barasat (north block)
+    "Barasat II, West Bengal, India",     # Barasat (south block)
+]
 
 
 # ── Graph loader (cached) ─────────────────────────────────────────────────────
 
 def _load_graph():
     """
-    Load the Kolkata drive network.
-    - First run  : downloads from OSM and saves to GRAPH_CACHE_PATH
-    - Later runs : loads from the cached GraphML file (fast)
+    Load the Kolkata + suburbs drive network.
+    - First run  : downloads from OSM by place names, saves to pickle
+    - Later runs : loads from the cached pickle file (~2 seconds)
     """
     cache_path = GRAPH_CACHE_PATH
 
     if os.path.exists(cache_path):
         print(f"  [Route] Loading cached graph from {cache_path} ...")
-        graph = ox.load_graphml(cache_path)
+        with open(cache_path, "rb") as f:
+            graph = pickle.load(f)
+        print(f"  [Route] Graph loaded ({len(graph.nodes):,} nodes, "
+              f"{len(graph.edges):,} edges)")
     else:
-        print(f"  [Route] Downloading OSM graph for {DEFAULT_CITY} (one-time, ~30s) ...")
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        graph = ox.graph_from_place(DEFAULT_CITY, network_type="drive")
-        ox.save_graphml(graph, cache_path)
-        print(f"  [Route] Graph cached to {cache_path}")
+        graph = _download_and_cache(cache_path)
 
     return graph
+
+
+def _download_and_cache(cache_path: str):
+    """
+    Download the OSM road network for the named places and cache it.
+
+    Each place is a small administrative polygon — Overpass handles
+    them individually with no subdivision, keeping queries fast.
+    Tries multiple public mirrors if the primary is unavailable.
+    """
+    # OSMnx 2.x appends "/interpreter" to overpass_url automatically.
+    # Set the base URL only (no trailing /interpreter).
+    OVERPASS_ENDPOINTS = [
+        "https://overpass-api.de/api",
+        "https://overpass.kumi.systems/api",
+        "https://overpass.openstreetmap.ru/api",
+    ]
+
+    print(f"  [Route] Downloading OSM road network for:")
+    for p in GRAPH_PLACES:
+        print(f"           * {p}")
+    print(f"  [Route] One-time download, ~30-60 seconds ...")
+
+    ox.settings.timeout = 180  # 3 min per endpoint before trying next mirror
+
+    last_error = None
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            print(f"  [Route] Trying Overpass endpoint: {endpoint}")
+            ox.settings.overpass_url = endpoint
+
+            graph = ox.graph_from_place(
+                GRAPH_PLACES,
+                network_type="drive",
+                retain_all=False,
+            )
+
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pickle.dump(graph, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            print(f"  [Route] Graph cached to {cache_path} "
+                  f"({len(graph.nodes):,} nodes, {len(graph.edges):,} edges)")
+            return graph
+
+        except Exception as e:
+            print(f"  [Route] Endpoint failed: {e.__class__.__name__}: {str(e)[:120]}")
+            last_error = e
+            continue
+
+    raise RuntimeError(
+        "All Overpass API endpoints failed.\n"
+        "The public servers may be overloaded — wait a few minutes and retry.\n"
+        f"Last error: {last_error}"
+    )
 
 
 # ── Geocoding with city context ───────────────────────────────────────────────
 
 def _geocode_with_context(place: str) -> tuple[float, float]:
     """
-    Geocode a place name, automatically appending ', Kolkata, India'
-    if the query doesn't already mention Kolkata or India.
-
-    This lets users type short names like:
-        "Park Street"  →  "Park Street, Kolkata, India"
-        "Salt Lake Sector V"  →  "Salt Lake Sector V, Kolkata, India"
-        "Howrah Bridge"  →  "Howrah Bridge, Kolkata, India"
+    Geocode a place name, appending ', West Bengal, India' if no
+    regional keyword is present. Uses West Bengal (not just Kolkata)
+    so suburbs like Barasat resolve to the correct district.
     """
-    city_hint = DEFAULT_CITY  # "Kolkata, India"
-    city_lower = place.lower()
+    place_lower = place.lower()
 
     needs_hint = not any(
-        kw in city_lower
-        for kw in ("kolkata", "calcutta", "india", "west bengal", "wb")
+        kw in place_lower
+        for kw in ("kolkata", "calcutta", "india", "west bengal", "wb",
+                   "north 24", "south 24", "24 parganas")
     )
 
-    query = f"{place}, {city_hint}" if needs_hint else place
+    query = f"{place}, West Bengal, India" if needs_hint else place
 
     try:
         coords = ox.geocode(query)
-        print(f"  [Route] Geocoded '{place}' → {coords}")
+        print(f"  [Route] Geocoded '{place}' -> {coords}")
         return coords
     except Exception:
-        # Retry without city hint in case the full string confuses the geocoder
-        print(f"  [Route] Retrying geocode without city hint for '{place}' ...")
+        print(f"  [Route] Retrying geocode without region hint for '{place}' ...")
         coords = ox.geocode(place)
-        print(f"  [Route] Geocoded '{place}' → {coords}")
+        print(f"  [Route] Geocoded '{place}' -> {coords}")
         return coords
+
+
+# ── Haversine distance (sanity check) ────────────────────────────────────────
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Straight-line distance in km between two lat/lon points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_route(source: str, destination: str):
     """
-    Compute the shortest driving route between source and destination
-    within the Kolkata road network.
-
-    Args:
-        source:      Origin locality / address (e.g. "Howrah Station")
-        destination: Destination locality / address (e.g. "Salt Lake Sector V")
+    Compute the shortest driving route between source and destination.
 
     Returns:
-        (graph, route) — OSMnx MultiDiGraph and list of node IDs
+        (graph, route) -- OSMnx MultiDiGraph and list of node IDs
     """
     graph = _load_graph()
 
     src_coords  = _geocode_with_context(source)
     dest_coords = _geocode_with_context(destination)
 
-    src_node = ox.distance.nearest_nodes(
-        graph,
-        X=src_coords[1],   # longitude
-        Y=src_coords[0],   # latitude
-    )
-    dest_node = ox.distance.nearest_nodes(
-        graph,
-        X=dest_coords[1],
-        Y=dest_coords[0],
-    )
+    src_node  = ox.distance.nearest_nodes(graph, X=src_coords[1],  Y=src_coords[0])
+    dest_node = ox.distance.nearest_nodes(graph, X=dest_coords[1], Y=dest_coords[0])
 
     route = ox.shortest_path(graph, src_node, dest_node)
-
     if route is None:
         raise ValueError(
-            f"No route found between '{source}' and '{destination}' "
-            f"in the Kolkata road network. "
-            "Try using a more specific address or a well-known landmark."
+            f"No route found between '{source}' and '{destination}'. "
+            "Try a more specific address or well-known landmark."
         )
 
     return graph, route
 
 
+def get_k_routes(source: str, destination: str, k: int = 3):
+    """
+    Compute up to k alternative driving routes using edge-weight
+    perturbation to generate route diversity.
+
+    Each route dict contains:
+        route_id        -- integer index (0-based)
+        route_label     -- "Route 1", "Route 2", ...
+        nodes           -- list of OSMnx node IDs
+        roads           -- list of unique named road segments
+        distance_km     -- total distance in km
+        travel_time_min -- estimated time at 30 km/h avg
+
+    Returns:
+        (graph, routes) -- OSMnx MultiDiGraph and list of route dicts
+    """
+    graph = _load_graph()
+
+    src_coords  = _geocode_with_context(source)
+    dest_coords = _geocode_with_context(destination)
+
+    # Straight-line sanity check
+    crow_km = _haversine_km(src_coords[0], src_coords[1],
+                            dest_coords[0], dest_coords[1])
+    print(f"  [Route] Straight-line distance: {crow_km:.1f} km")
+    if crow_km < 1.0:
+        print(f"  WARNING: Source and destination are only {crow_km:.2f} km apart "
+              f"as the crow flies. Check that the place names are correct.")
+
+    src_node  = ox.distance.nearest_nodes(graph, X=src_coords[1],  Y=src_coords[0])
+    dest_node = ox.distance.nearest_nodes(graph, X=dest_coords[1], Y=dest_coords[0])
+
+    # Generate k routes via edge-weight perturbation
+    G = graph.copy()
+    routes_raw: list[list] = []
+    seen_edge_sets: list[frozenset] = []
+    PENALTY_FACTOR = 5.0
+
+    for _attempt in range(k * 4):
+        if len(routes_raw) >= k:
+            break
+
+        route = ox.shortest_path(G, src_node, dest_node, weight="length")
+        if route is None:
+            break
+
+        edge_set = frozenset(zip(route[:-1], route[1:]))
+        if edge_set in seen_edge_sets:
+            for u, v in zip(route[:-1], route[1:]):
+                for key in G[u][v]:
+                    G[u][v][key]["length"] *= PENALTY_FACTOR
+            continue
+
+        routes_raw.append(route)
+        seen_edge_sets.append(edge_set)
+
+        for u, v in zip(route[:-1], route[1:]):
+            for key in G[u][v]:
+                G[u][v][key]["length"] *= PENALTY_FACTOR
+
+    if not routes_raw:
+        raise ValueError(
+            f"No route found between '{source}' and '{destination}'. "
+            "Try a more specific address or well-known landmark."
+        )
+
+    # Build route dicts using original (unperturbed) edge lengths
+    routes = []
+    for idx, node_list in enumerate(routes_raw):
+        roads = extract_road_names(graph, node_list)
+
+        total_m = sum(
+            graph.get_edge_data(u, v, 0).get("length", 0)
+            for u, v in zip(node_list[:-1], node_list[1:])
+        )
+        distance_km     = round(total_m / 1000, 2)
+        travel_time_min = round((distance_km / 30) * 60)
+
+        # Extract (lat, lon) for every node — used for spatial corridor filtering
+        coords = [
+            (graph.nodes[n]["y"], graph.nodes[n]["x"])
+            for n in node_list
+            if "y" in graph.nodes[n] and "x" in graph.nodes[n]
+        ]
+
+        routes.append({
+            "route_id":        idx,
+            "route_label":     f"Route {idx + 1}",
+            "nodes":           node_list,
+            "coords":          coords,   # list of (lat, lon) tuples
+            "roads":           roads,
+            "distance_km":     distance_km,
+            "travel_time_min": travel_time_min,
+        })
+
+    return graph, routes
+
+
+def get_multiple_routes(source: str, destination: str, n_routes: int = 3) -> dict:
+    """
+    Compute up to n_routes alternative driving routes and return them
+    in the shape expected by the FastAPI frontend.
+
+    Returns:
+    {
+        "graph":       OSMnx MultiDiGraph  (pop before JSON serialisation),
+        "source":      str,
+        "destination": str,
+        "src_coords":  [lat, lon],
+        "dst_coords":  [lat, lon],
+        "routes": [
+            {
+                "id":              int,
+                "label":           str,
+                "road_names":      list[str],
+                "distance_km":     float,
+                "travel_time_min": float,
+                "geojson":         dict,   # GeoJSON FeatureCollection / LineString
+                "node_ids":        list[int],
+                "coords":          list[tuple[float, float]],  # (lat,lon) per node
+            },
+            ...
+        ]
+    }
+    """
+    graph = _load_graph()
+
+    src_coords  = _geocode_with_context(source)
+    dest_coords = _geocode_with_context(destination)
+
+    crow_km = _haversine_km(src_coords[0], src_coords[1],
+                            dest_coords[0], dest_coords[1])
+    print(f"  [Route] Straight-line distance: {crow_km:.1f} km")
+
+    src_node  = ox.distance.nearest_nodes(graph, X=src_coords[1],  Y=src_coords[0])
+    dest_node = ox.distance.nearest_nodes(graph, X=dest_coords[1], Y=dest_coords[0])
+
+    # Generate n_routes via edge-weight perturbation
+    G = graph.copy()
+    routes_raw: list[list] = []
+    seen_edge_sets: list[frozenset] = []
+    PENALTY_FACTOR = 5.0
+
+    for _attempt in range(n_routes * 4):
+        if len(routes_raw) >= n_routes:
+            break
+        route = ox.shortest_path(G, src_node, dest_node, weight="length")
+        if route is None:
+            break
+        edge_set = frozenset(zip(route[:-1], route[1:]))
+        if edge_set in seen_edge_sets:
+            for u, v in zip(route[:-1], route[1:]):
+                for key in G[u][v]:
+                    G[u][v][key]["length"] *= PENALTY_FACTOR
+            continue
+        routes_raw.append(route)
+        seen_edge_sets.append(edge_set)
+        for u, v in zip(route[:-1], route[1:]):
+            for key in G[u][v]:
+                G[u][v][key]["length"] *= PENALTY_FACTOR
+
+    if not routes_raw:
+        raise ValueError(
+            f"No route found between '{source}' and '{destination}'. "
+            "Try a more specific address or a well-known landmark."
+        )
+
+    routes_out = []
+    for idx, node_list in enumerate(routes_raw):
+        roads = extract_road_names(graph, node_list)
+
+        total_m = sum(
+            graph.get_edge_data(u, v, 0).get("length", 0)
+            for u, v in zip(node_list[:-1], node_list[1:])
+        )
+        distance_km     = round(total_m / 1000, 2)
+        travel_time_min = round((distance_km / 30) * 60)
+
+        # (lat, lon) per node — used by spatial corridor filter
+        coords = [
+            (graph.nodes[n]["y"], graph.nodes[n]["x"])
+            for n in node_list
+            if "y" in graph.nodes[n] and "x" in graph.nodes[n]
+        ]
+
+        # GeoJSON — coordinates must be [lon, lat] per spec
+        geojson_coords = [
+            [graph.nodes[n]["x"], graph.nodes[n]["y"]]
+            for n in node_list
+            if "x" in graph.nodes[n] and "y" in graph.nodes[n]
+        ]
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": geojson_coords,
+                },
+                "properties": {
+                    "label":           f"Route {idx + 1}",
+                    "distance_km":     distance_km,
+                    "travel_time_min": travel_time_min,
+                },
+            }],
+        }
+
+        routes_out.append({
+            "id":              idx,
+            "label":           f"Route {idx + 1}",
+            "road_names":      roads,
+            "distance_km":     distance_km,
+            "travel_time_min": travel_time_min,
+            "geojson":         geojson,
+            "node_ids":        node_list,
+            "coords":          coords,
+        })
+
+    return {
+        "graph":       graph,        # pop before serialising to JSON
+        "source":      source,
+        "destination": destination,
+        "src_coords":  list(src_coords),
+        "dst_coords":  list(dest_coords),
+        "routes":      routes_out,
+    }
+
+
 def extract_road_names(graph, route: list) -> list[str]:
     """
-    Extract unique named road segments from a route.
-
-    Returns a list of road names in the order they first appear,
-    filtering out unnamed segments.
+    Extract unique named road segments from a route in traversal order.
+    Filters out unnamed segments.
     """
     seen  = set()
     roads = []
@@ -131,11 +430,9 @@ def extract_road_names(graph, route: list) -> list[str]:
 
         edge = list(edge_data.values())[0]
         name = edge.get("name")
-
         if not name:
             continue
 
-        # OSMnx sometimes returns a list when multiple names exist
         names = name if isinstance(name, list) else [name]
         for n in names:
             if n and n not in seen:
