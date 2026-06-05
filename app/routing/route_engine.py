@@ -28,7 +28,7 @@ import pickle
 import math
 import osmnx as ox
 
-from config import GRAPH_CACHE_PATH
+from config import GRAPH_CACHE_PATH, MAX_ROUTES, MIN_ROUTE_DIVERGENCE, MAX_CONSECUTIVE_DUPES
 
 
 # ── Named places that together cover all 15 menu localities ──────────────────
@@ -187,10 +187,34 @@ def get_route(source: str, destination: str):
     return graph, route
 
 
-def get_k_routes(source: str, destination: str, k: int = 3):
+def _routes_are_distinct(edge_set_a: frozenset, edge_set_b: frozenset,
+                         min_divergence: float = 0.40) -> bool:
     """
-    Compute up to k alternative driving routes using edge-weight
-    perturbation to generate route diversity.
+    Return True if two routes are genuinely different.
+
+    Two routes are considered duplicates if they share more than
+    (1 - min_divergence) of their edges by Jaccard similarity.
+    Default: routes must differ by at least 40% of edges.
+    """
+    if not edge_set_a or not edge_set_b:
+        return True
+    intersection = len(edge_set_a & edge_set_b)
+    union        = len(edge_set_a | edge_set_b)
+    jaccard      = intersection / union if union else 1.0
+    return jaccard < (1.0 - min_divergence)
+
+
+def get_k_routes(source: str, destination: str, k: int = None):
+    """
+    Compute all genuinely distinct driving routes between source and
+    destination using edge-weight perturbation.
+
+    When k is None (default), the algorithm runs until no more distinct
+    routes can be found, up to MAX_ROUTES (from config / .env).
+    Pass an explicit k to override.
+
+    Two routes are considered distinct when their edge sets differ by at
+    least MIN_ROUTE_DIVERGENCE (Jaccard threshold, from config / .env).
 
     Each route dict contains:
         route_id        -- integer index (0-based)
@@ -203,12 +227,16 @@ def get_k_routes(source: str, destination: str, k: int = 3):
     Returns:
         (graph, routes) -- OSMnx MultiDiGraph and list of route dicts
     """
+    PENALTY_FACTOR      = 5.0
+    MAX_ATTEMPTS_FACTOR = 6   # total attempts = max_routes * this
+
+    max_routes = k if k is not None else MAX_ROUTES
+
     graph = _load_graph()
 
     src_coords  = _geocode_with_context(source)
     dest_coords = _geocode_with_context(destination)
 
-    # Straight-line sanity check
     crow_km = _haversine_km(src_coords[0], src_coords[1],
                             dest_coords[0], dest_coords[1])
     print(f"  [Route] Straight-line distance: {crow_km:.1f} km")
@@ -219,14 +247,18 @@ def get_k_routes(source: str, destination: str, k: int = 3):
     src_node  = ox.distance.nearest_nodes(graph, X=src_coords[1],  Y=src_coords[0])
     dest_node = ox.distance.nearest_nodes(graph, X=dest_coords[1], Y=dest_coords[0])
 
-    # Generate k routes via edge-weight perturbation
     G = graph.copy()
-    routes_raw: list[list] = []
+    routes_raw: list[list]          = []
     seen_edge_sets: list[frozenset] = []
-    PENALTY_FACTOR = 5.0
+    consecutive_dupes = 0
 
-    for _attempt in range(k * 4):
-        if len(routes_raw) >= k:
+    for _attempt in range(max_routes * MAX_ATTEMPTS_FACTOR):
+        if len(routes_raw) >= max_routes:
+            print(f"  [Route] Reached cap of {max_routes} routes.")
+            break
+        if consecutive_dupes >= MAX_CONSECUTIVE_DUPES:
+            print(f"  [Route] No new distinct routes found after "
+                  f"{MAX_CONSECUTIVE_DUPES} consecutive attempts — stopping.")
             break
 
         route = ox.shortest_path(G, src_node, dest_node, weight="length")
@@ -234,24 +266,33 @@ def get_k_routes(source: str, destination: str, k: int = 3):
             break
 
         edge_set = frozenset(zip(route[:-1], route[1:]))
-        if edge_set in seen_edge_sets:
-            for u, v in zip(route[:-1], route[1:]):
-                for key in G[u][v]:
-                    G[u][v][key]["length"] *= PENALTY_FACTOR
-            continue
 
-        routes_raw.append(route)
-        seen_edge_sets.append(edge_set)
+        is_new = all(
+            _routes_are_distinct(edge_set, prev, MIN_ROUTE_DIVERGENCE)
+            for prev in seen_edge_sets
+        )
 
         for u, v in zip(route[:-1], route[1:]):
             for key in G[u][v]:
                 G[u][v][key]["length"] *= PENALTY_FACTOR
+
+        if not is_new:
+            consecutive_dupes += 1
+            continue
+
+        routes_raw.append(route)
+        seen_edge_sets.append(edge_set)
+        consecutive_dupes = 0
+        print(f"  [Route] Found Route {len(routes_raw)} "
+              f"({len(route)} nodes, attempt {_attempt + 1})")
 
     if not routes_raw:
         raise ValueError(
             f"No route found between '{source}' and '{destination}'. "
             "Try a more specific address or well-known landmark."
         )
+
+    print(f"  [Route] Total distinct routes found: {len(routes_raw)}")
 
     # Build route dicts using original (unperturbed) edge lengths
     routes = []
@@ -285,33 +326,20 @@ def get_k_routes(source: str, destination: str, k: int = 3):
     return graph, routes
 
 
-def get_multiple_routes(source: str, destination: str, n_routes: int = 3) -> dict:
+def get_multiple_routes(source: str, destination: str, n_routes: int = None) -> dict:
     """
-    Compute up to n_routes alternative driving routes and return them
-    in the shape expected by the FastAPI frontend.
+    Compute all genuinely distinct driving routes and return them in the
+    shape expected by the FastAPI frontend.
 
-    Returns:
-    {
-        "graph":       OSMnx MultiDiGraph  (pop before JSON serialisation),
-        "source":      str,
-        "destination": str,
-        "src_coords":  [lat, lon],
-        "dst_coords":  [lat, lon],
-        "routes": [
-            {
-                "id":              int,
-                "label":           str,
-                "road_names":      list[str],
-                "distance_km":     float,
-                "travel_time_min": float,
-                "geojson":         dict,   # GeoJSON FeatureCollection / LineString
-                "node_ids":        list[int],
-                "coords":          list[tuple[float, float]],  # (lat,lon) per node
-            },
-            ...
-        ]
-    }
+    When n_routes is None (default), the algorithm runs until no more
+    distinct routes are found, up to MAX_ROUTES (from config / .env).
+    Pass an explicit n_routes to override.
     """
+    PENALTY_FACTOR      = 5.0
+    MAX_ATTEMPTS_FACTOR = 6
+
+    max_routes = n_routes if n_routes is not None else MAX_ROUTES
+
     graph = _load_graph()
 
     src_coords  = _geocode_with_context(source)
@@ -324,35 +352,52 @@ def get_multiple_routes(source: str, destination: str, n_routes: int = 3) -> dic
     src_node  = ox.distance.nearest_nodes(graph, X=src_coords[1],  Y=src_coords[0])
     dest_node = ox.distance.nearest_nodes(graph, X=dest_coords[1], Y=dest_coords[0])
 
-    # Generate n_routes via edge-weight perturbation
     G = graph.copy()
-    routes_raw: list[list] = []
+    routes_raw: list[list]          = []
     seen_edge_sets: list[frozenset] = []
-    PENALTY_FACTOR = 5.0
+    consecutive_dupes = 0
 
-    for _attempt in range(n_routes * 4):
-        if len(routes_raw) >= n_routes:
+    for _attempt in range(max_routes * MAX_ATTEMPTS_FACTOR):
+        if len(routes_raw) >= max_routes:
+            print(f"  [Route] Reached cap of {max_routes} routes.")
             break
+        if consecutive_dupes >= MAX_CONSECUTIVE_DUPES:
+            print(f"  [Route] No new distinct routes after "
+                  f"{MAX_CONSECUTIVE_DUPES} consecutive attempts — stopping.")
+            break
+
         route = ox.shortest_path(G, src_node, dest_node, weight="length")
         if route is None:
             break
+
         edge_set = frozenset(zip(route[:-1], route[1:]))
-        if edge_set in seen_edge_sets:
-            for u, v in zip(route[:-1], route[1:]):
-                for key in G[u][v]:
-                    G[u][v][key]["length"] *= PENALTY_FACTOR
-            continue
-        routes_raw.append(route)
-        seen_edge_sets.append(edge_set)
+
+        is_new = all(
+            _routes_are_distinct(edge_set, prev, MIN_ROUTE_DIVERGENCE)
+            for prev in seen_edge_sets
+        )
+
         for u, v in zip(route[:-1], route[1:]):
             for key in G[u][v]:
                 G[u][v][key]["length"] *= PENALTY_FACTOR
+
+        if not is_new:
+            consecutive_dupes += 1
+            continue
+
+        routes_raw.append(route)
+        seen_edge_sets.append(edge_set)
+        consecutive_dupes = 0
+        print(f"  [Route] Found Route {len(routes_raw)} "
+              f"({len(route)} nodes, attempt {_attempt + 1})")
 
     if not routes_raw:
         raise ValueError(
             f"No route found between '{source}' and '{destination}'. "
             "Try a more specific address or a well-known landmark."
         )
+
+    print(f"  [Route] Total distinct routes found: {len(routes_raw)}")
 
     routes_out = []
     for idx, node_list in enumerate(routes_raw):

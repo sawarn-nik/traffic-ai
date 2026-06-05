@@ -58,10 +58,24 @@ TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
 # ── Routing ───────────────────────────────────────────────────────────────────
-DEFAULT_CITY     = os.getenv("DEFAULT_CITY", "Kolkata, India")
+DEFAULT_CITY = os.getenv("DEFAULT_CITY", "Kolkata, India")
+
 GRAPH_CACHE_PATH = os.getenv(
     "GRAPH_CACHE_PATH",
     os.path.join(_APP_DIR, "cache", "graph.pkl"),
+)
+
+# Route generation settings
+MAX_ROUTES = int(os.getenv("MAX_ROUTES", "10"))
+
+# Minimum percentage difference between routes
+MIN_ROUTE_DIVERGENCE = float(
+    os.getenv("MIN_ROUTE_DIVERGENCE", "0.20")
+)
+
+# Avoid repeated same route attempts
+MAX_CONSECUTIVE_DUPES = int(
+    os.getenv("MAX_CONSECUTIVE_DUPES", "3")
 )
 
 # ── Database ──────────────────────────────────────────────────────────────────

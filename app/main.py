@@ -59,7 +59,6 @@ from config import (
 # ── Pipeline constants ────────────────────────────────────────────────────────
 
 MAX_ROADS               = 6   # top N road segments to query
-MAX_ALTERNATIVE_ROUTES  = 3   # number of route options to evaluate
 MAX_ARTICLES_PER_SOURCE = 3   # per road per source
 MAX_CITY_FEED_ARTICLES  = 4   # from Kolkata city-wide feeds
 RECENT_DAYS             = 7   # articles older than this are flagged as historical
@@ -559,7 +558,7 @@ def run():
     # ── Step 1: Compute alternative routes ───────────────────────────────────
     print("\n[1/5] Computing alternative routes on Kolkata road network...")
     try:
-        graph, routes = get_k_routes(source, destination, k=MAX_ALTERNATIVE_ROUTES)
+        graph, routes = get_k_routes(source, destination)
     except ValueError as e:
         print(f"\n  ✗ Route error: {e}")
         session.close()

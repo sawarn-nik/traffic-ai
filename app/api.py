@@ -433,7 +433,7 @@ def compute_routes_only(req: RouteRequest):
     All routes get placeholder risk=LOW/score=0 until /api/disruptions runs.
     """
     try:
-        result = get_multiple_routes(req.source, req.destination, n_routes=3)
+        result = get_multiple_routes(req.source, req.destination)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
