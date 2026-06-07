@@ -48,6 +48,7 @@ from config import (
     ENABLE_TOMTOM, ENABLE_WEATHER, ENABLE_SCRAPER,
     ENABLE_NEWSAPI, ENABLE_RSS,
 )
+from weather.route_weather import analyze_route_weather
 
 app = FastAPI(title="Kolkata Traffic AI", version="2.0")
 
@@ -368,20 +369,55 @@ def _process_articles(articles: list[dict], session) -> list[dict]:
 
 
 def _score_route(route_data: dict, events: list[dict]) -> dict:
-    """Score a route using spatial corridor + road name matching."""
-    coords     = route_data.get("coords")
+    """Score a route using spatial corridor + road name matching + weather."""
+
+    coords = route_data.get("coords")
     road_names = route_data.get("road_names", [])
 
     route_events, _ = filter_by_route_relevance(
-        results      = events,
-        route_roads  = road_names,
-        route_coords = [tuple(c) for c in coords] if coords else None,
-        corridor_km  = 2.0,
+        results=events,
+        route_roads=road_names,
+        route_coords=[tuple(c) for c in coords] if coords else None,
+        corridor_km=2.0,
     )
 
-    recent    = [e for e in route_events if e.get("is_recent", True)
-                                         and not e.get("is_future_event", False)]
+    recent = [
+        e for e in route_events
+        if e.get("is_recent", True)
+        and not e.get("is_future_event", False)
+    ]
+
     risk_score = sum(e["weighted_score"] for e in recent)
+
+    # ── Weather Analysis ──────────────────────────────
+
+    weather_profile = {
+        "avg_wsi": None,
+        "max_wsi": None,
+        "severity": "unknown",
+        "sample_points": 0,
+        "success": False
+    }
+
+    if coords:
+        try:
+            print("\n========== WEATHER DEBUG ==========")
+            print("Route:", route_data["label"])
+            print("Coords:", len(coords) if coords else 0)
+            weather_profile = analyze_route_weather(coords)
+            
+            print(weather_profile)
+            
+            print(
+            f"[Weather] {route_data['label']} "
+            f"WSI={weather_profile['avg_wsi']} "
+            f"Severity={weather_profile['severity']}"
+        )
+
+        except Exception as e:
+            print(f"[Weather] Route weather analysis failed: {e}")
+
+    # ── Existing Risk Logic ───────────────────────────
 
     if risk_score >= 25:
         risk_level = "CRITICAL"
@@ -396,20 +432,59 @@ def _score_route(route_data: dict, events: list[dict]) -> dict:
 
     return {
         **route_data,
-        "risk_score":     round(risk_score, 2),
-        "risk_level":     risk_level,
-        "risk_color":     RISK_COLOR.get(risk_level, "#27ae60"),
+
+        "risk_score": round(risk_score, 2),
+
+        "risk_level": risk_level,
+
+        "risk_color": RISK_COLOR.get(
+            risk_level,
+            "#27ae60"
+        ),
+
         "matched_events": route_events,
-        "event_count":    len(recent),
+
+        "event_count": len(recent),
+
+        "weather": {
+            "avg_wsi": weather_profile["avg_wsi"],
+            "max_wsi": weather_profile["max_wsi"],
+            "severity": weather_profile["severity"],
+            "sample_points": weather_profile["sample_points"]
+        }
     }
 
-
 def _pick_best_route(scored: list[dict]) -> int:
-    """Pick best route: lowest composite score (travel_time × (1 + risk/10))."""
-    def composite(r):
-        return r["travel_time_min"] * (1 + r["risk_score"] / 10)
-    return min(range(len(scored)), key=lambda i: composite(scored[i]))
+    """
+    Pick best route using:
+      travel time
+      disruption risk
+      weather risk
+    """
 
+    def composite(route):
+
+        travel_time = route["travel_time_min"]
+
+        disruption_risk = route["risk_score"]
+
+        weather_risk = 0
+
+        if route.get("weather"):
+            weather_risk = (
+                route["weather"].get("avg_wsi") or 0
+            )
+
+        return (
+            travel_time
+            + (disruption_risk * 3)
+            + (weather_risk * 20)
+        )
+
+    return min(
+        range(len(scored)),
+        key=lambda i: composite(scored[i])
+    )
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 

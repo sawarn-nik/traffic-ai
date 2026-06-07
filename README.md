@@ -18,9 +18,9 @@ You pick:  Howrah Station  →  Salt Lake Sector V
 System:
   Step 1 (instant ~2s)  — Computes 2–3 alternative routes on Kolkata road graph
   Step 2 (background)   — Fetches Google News RSS + NewsAPI + TomTom Live incidents
-                         — LLM extracts event_type, location, severity σ, confidence κ
-                         — Scores each route: risk = Σ(σ × κ) for recent events
-                         — Updates map with colour-coded routes + disruption markers
+                        — LLM extracts event_type, location, severity σ, confidence κ
+                        — Scores each route: risk = Σ(σ × κ) for recent events
+                        — Updates map with colour-coded routes + disruption markers
 ```
 
 **The map draws immediately. Disruption analysis fills in the background.**
@@ -42,6 +42,8 @@ cd traffic-ai
 python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r req.txt
+
+"Here python 3.11 is only compatible and working properly"
 ```
 
 ### 3. API keys
