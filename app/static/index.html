@@ -305,8 +305,31 @@ function renderCards(routes, markers, disruptionsReady){
         <div><div class="stat-val">${r.distance_km}</div><div class="stat-lbl">km</div></div>
         <div><div class="stat-val" style="color:${riskColor}">${r.risk_score||0}</div><div class="stat-lbl">risk</div></div>
       </div>
-      <div class="rc-roads">${(r.road_names||[]).slice(0,4).join(' · ')}</div>
-      <div class="rc-evts ${evtCount?'warn':'ok'}">
+      <div class="rc-roads">
+  ${(r.road_names||[]).slice(0,4).join(' · ')}
+</div>
+
+${
+r.weather ?
+`
+<div style="
+  margin-top:8px;
+  padding:6px;
+  background:#16213e;
+  border-radius:6px;
+  font-size:11px;
+  color:#ddd;
+">
+  🌦 Weather Risk: <b>${r.weather.avg_wsi ?? "N/A"}</b><br>
+  ⚠ Severity: <b>${(r.weather.severity || "unknown").toUpperCase()}</b><br>
+  📍 Sample Points: <b>${r.weather.sample_points ?? 0}</b>
+</div>
+`
+:
+''
+}
+
+<div class="rc-evts ${evtCount?'warn':'ok'}">
         ${!disruptionsReady?'<span style="color:#555">⏳ Analysing…</span>':evtCount?`⚠ ${evtCount} disruption${evtCount>1?'s':''}`:'✓ No disruptions'}
       </div>
     </div>`;
