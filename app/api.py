@@ -23,9 +23,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from routing.route_engine import get_multiple_routes
+from routing.multimodal import get_routes_for_mode, get_metro_geojson_overlay
 from ingestion.rss_fetcher import fetch_rss_for_query, fetch_kolkata_city_feeds
 from ingestion.news_fetcher import fetch_news
 from ingestion.tomtom_fetcher import fetch_tomtom_incidents
@@ -48,7 +50,8 @@ from config import (
     ENABLE_TOMTOM, ENABLE_WEATHER, ENABLE_SCRAPER,
     ENABLE_NEWSAPI, ENABLE_RSS,
 )
-from weather.route_weather import analyze_route_weather
+from weather.route_weather import fetch_weather as _fetch_weather_point
+from weather.weather_risk import compute_weather_risk
 
 app = FastAPI(title="Kolkata Traffic AI", version="2.0")
 
@@ -58,6 +61,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve CSS/JS from app/static/ at /static/*
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -92,6 +99,7 @@ KOLKATA_LOCATIONS = [
 class RouteRequest(BaseModel):
     source:      str
     destination: str
+    mode:        str = "drive"   # drive | walk | bike | metro
 
 
 class RouteSummary(BaseModel):
@@ -108,6 +116,8 @@ class RouteSummary(BaseModel):
     matched_events:  list[dict] | None = None
     event_count:     int | None = None
     is_best:         bool | None = None
+    mode:            str | None = None
+    segments:        list[dict] | None = None   # metro legs
 
 
 class DisruptionRequest(BaseModel):
@@ -115,6 +125,7 @@ class DisruptionRequest(BaseModel):
     destination: str
     road_names:  list[str]
     routes:      list[RouteSummary] | None = None
+    mode:        str = "drive"
 
 
 # ── City-wide article fetchers ─────────────────────────────────────────────────
@@ -368,123 +379,146 @@ def _process_articles(articles: list[dict], session) -> list[dict]:
     return results
 
 
-def _score_route(route_data: dict, events: list[dict]) -> dict:
-    """Score a route using spatial corridor + road name matching + weather."""
+def _fetch_city_weather(all_routes: list[dict]) -> dict:
+    """
+    Fetch weather ONCE for the city using the midpoint of the first route.
 
-    coords = route_data.get("coords")
+    Weather is city-wide (heavy rain / high winds affect all routes equally)
+    so we sample a single representative location rather than per-route points.
+    Falls back to the first route's midpoint coordinate, or Kolkata city centre.
+
+    Returns a weather profile dict:
+      {avg_wsi, max_wsi, severity, sample_points, score, success, coords_used}
+    """
+    if not OPENWEATHER_API_KEY:
+        return {"avg_wsi": None, "max_wsi": None, "severity": "unknown",
+                "sample_points": 0, "score": 0.0, "success": False,
+                "coords_used": None}
+
+    # Pick a representative point — midpoint of the first route's coord list,
+    # or Kolkata city centre as fallback (22.5726°N, 88.3639°E).
+    KOLKATA_CENTRE = (22.5726, 88.3639)
+    sample_coord = KOLKATA_CENTRE
+
+    for route in all_routes:
+        coords = route.get("coords") or []
+        if coords:
+            mid_idx = len(coords) // 2
+            sample_coord = coords[mid_idx]
+            break
+
+    try:
+        lat, lon = float(sample_coord[0]), float(sample_coord[1])
+        weather_pt = _fetch_weather_point(lat, lon)
+
+        if not weather_pt:
+            return {"avg_wsi": None, "max_wsi": None, "severity": "unknown",
+                    "sample_points": 0, "score": 0.0, "success": False,
+                    "coords_used": sample_coord}
+
+        risk = compute_weather_risk(weather_pt)
+        wsi  = risk["wsi"]
+        # Scale WSI [0–1] → disruption-score scale (max ~10 pts)
+        # WSI=0.3 (medium rain) → +3 pts,  WSI=0.7 (heavy monsoon) → +7 pts
+        weather_score = round(wsi * 10, 2)
+
+        print(f"  [Weather] City-wide sample at ({lat:.4f},{lon:.4f}) "
+              f"WSI={wsi:.2f} → city_weather_score={weather_score}")
+
+        return {
+            "avg_wsi":     wsi,
+            "max_wsi":     wsi,         # single point, avg == max
+            "severity":    risk["severity"],
+            "sample_points": 1,
+            "score":       weather_score,
+            "success":     True,
+            "coords_used": sample_coord,
+            "raw": weather_pt,          # full OWM fields for frontend tooltip
+        }
+
+    except Exception as e:
+        print(f"  [Weather] City-wide fetch failed: {e}")
+        return {"avg_wsi": None, "max_wsi": None, "severity": "unknown",
+                "sample_points": 0, "score": 0.0, "success": False,
+                "coords_used": sample_coord}
+
+
+def _score_route(route_data: dict, events: list[dict],
+                 city_weather: dict | None = None) -> dict:
+    """
+    Score a route using spatial corridor + road name matching.
+
+    Weather is city-wide so the same pre-fetched `city_weather` dict is applied
+    equally to every route — heavy monsoon rain affects all roads identically.
+    Pass city_weather=None to disable weather scoring (e.g. no API key).
+    """
+
+    coords     = route_data.get("coords")
     road_names = route_data.get("road_names", [])
 
     route_events, _ = filter_by_route_relevance(
-        results=events,
-        route_roads=road_names,
-        route_coords=[tuple(c) for c in coords] if coords else None,
-        corridor_km=2.0,
+        results      = events,
+        route_roads  = road_names,
+        route_coords = [tuple(c) for c in coords] if coords else None,
+        corridor_km  = 2.0,
     )
 
     recent = [
         e for e in route_events
-        if e.get("is_recent", True)
-        and not e.get("is_future_event", False)
+        if e.get("is_recent", True) and not e.get("is_future_event", False)
     ]
 
-    risk_score = sum(e["weighted_score"] for e in recent)
+    disruption_score = sum(e["weighted_score"] for e in recent)
 
-    # ── Weather Analysis ──────────────────────────────
+    # ── Weather — city-wide, identical for every route ────────────────────────
+    weather_score = 0.0
+    weather_out   = {"avg_wsi": None, "max_wsi": None, "severity": "unknown",
+                     "sample_points": 0, "score": 0.0, "city_wide": True}
 
-    weather_profile = {
-        "avg_wsi": None,
-        "max_wsi": None,
-        "severity": "unknown",
-        "sample_points": 0,
-        "success": False
-    }
+    if city_weather and city_weather.get("success"):
+        weather_score = city_weather.get("score", 0.0)
+        weather_out   = {
+            "avg_wsi":      city_weather.get("avg_wsi"),
+            "max_wsi":      city_weather.get("max_wsi"),
+            "severity":     city_weather.get("severity", "unknown"),
+            "sample_points": city_weather.get("sample_points", 0),
+            "score":        weather_score,
+            "city_wide":    True,
+            "raw":          city_weather.get("raw", {}),
+        }
 
-    if coords:
-        try:
-            print("\n========== WEATHER DEBUG ==========")
-            print("Route:", route_data["label"])
-            print("Coords:", len(coords) if coords else 0)
-            weather_profile = analyze_route_weather(coords)
-            
-            print(weather_profile)
-            
-            print(
-            f"[Weather] {route_data['label']} "
-            f"WSI={weather_profile['avg_wsi']} "
-            f"Severity={weather_profile['severity']}"
-        )
+    # ── Combined risk score ───────────────────────────────────────────────────
+    total_risk = round(disruption_score + weather_score, 2)
 
-        except Exception as e:
-            print(f"[Weather] Route weather analysis failed: {e}")
-
-    # ── Existing Risk Logic ───────────────────────────
-
-    if risk_score >= 25:
+    if total_risk >= 25:
         risk_level = "CRITICAL"
-    elif risk_score >= 12:
+    elif total_risk >= 12:
         risk_level = "HIGH"
-    elif risk_score >= 5:
+    elif total_risk >= 5:
         risk_level = "MODERATE"
-    elif risk_score > 0:
+    elif total_risk > 0:
         risk_level = "LOW"
     else:
         risk_level = "CLEAR"
 
     return {
         **route_data,
-
-        "risk_score": round(risk_score, 2),
-
-        "risk_level": risk_level,
-
-        "risk_color": RISK_COLOR.get(
-            risk_level,
-            "#27ae60"
-        ),
-
-        "matched_events": route_events,
-
-        "event_count": len(recent),
-
-        "weather": {
-            "avg_wsi": weather_profile["avg_wsi"],
-            "max_wsi": weather_profile["max_wsi"],
-            "severity": weather_profile["severity"],
-            "sample_points": weather_profile["sample_points"]
-        }
+        "risk_score":        total_risk,
+        "disruption_score":  round(disruption_score, 2),
+        "weather_score":     weather_score,
+        "risk_level":        risk_level,
+        "risk_color":        RISK_COLOR.get(risk_level, "#27ae60"),
+        "matched_events":    route_events,
+        "event_count":       len(recent),
+        "weather":           weather_out,
     }
 
+
 def _pick_best_route(scored: list[dict]) -> int:
-    """
-    Pick best route using:
-      travel time
-      disruption risk
-      weather risk
-    """
-
-    def composite(route):
-
-        travel_time = route["travel_time_min"]
-
-        disruption_risk = route["risk_score"]
-
-        weather_risk = 0
-
-        if route.get("weather"):
-            weather_risk = (
-                route["weather"].get("avg_wsi") or 0
-            )
-
-        return (
-            travel_time
-            + (disruption_risk * 3)
-            + (weather_risk * 20)
-        )
-
-    return min(
-        range(len(scored)),
-        key=lambda i: composite(scored[i])
-    )
+    """Best route = lowest composite: travel_time × (1 + total_risk/10)."""
+    def composite(r):
+        return r["travel_time_min"] * (1 + r["risk_score"] / 10)
+    return min(range(len(scored)), key=lambda i: composite(scored[i]))
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 
@@ -500,34 +534,49 @@ def get_locations():
     return {"locations": KOLKATA_LOCATIONS}
 
 
+@app.get("/api/metro-overlay")
+def metro_overlay():
+    """GeoJSON overlay of all Kolkata Metro lines + stations for map display."""
+    return get_metro_geojson_overlay()
+
+
 @app.post("/api/route")
 def compute_routes_only(req: RouteRequest):
     """
-    Step 1 — FAST (~2s). Computes routes via OSMnx, returns GeoJSON.
-    No LLM, no news. Map draws immediately.
+    Step 1 — FAST (~2s for drive; ~5s first-time for walk/bike).
+    Computes routes for the requested mode. Metro uses static station data.
     All routes get placeholder risk=LOW/score=0 until /api/disruptions runs.
     """
+    mode = req.mode or "drive"
     try:
-        result = get_multiple_routes(req.source, req.destination)
+        result = get_routes_for_mode(req.source, req.destination, mode)  # type: ignore
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Routing error: {e}")
 
-    result.pop("graph")   # OSMnx graph is not JSON-serialisable
+    # Mode-specific colours for route lines
+    MODE_COLOR = {
+        "drive": "#1a73e8",
+        "walk":  "#34a853",
+        "bike":  "#fbbc04",
+        "metro": "#9c27b0",
+    }
+    base_color = MODE_COLOR.get(mode, "#1a73e8")
 
     for r in result["routes"]:
         r["risk_score"]     = 0.0
         r["risk_level"]     = "LOW"
-        r["risk_color"]     = RISK_COLOR["LOW"]
+        r["risk_color"]     = base_color
         r["matched_events"] = []
         r["event_count"]    = 0
         r["is_best"]        = False
+        r.setdefault("mode", mode)
 
     if result["routes"]:
         result["routes"][0]["is_best"] = True
 
-    all_roads = list({road for route in result["routes"] for road in route["road_names"]})
+    all_roads = list({road for route in result["routes"] for road in route.get("road_names", [])})
 
     return {
         **result,
@@ -537,6 +586,7 @@ def compute_routes_only(req: RouteRequest):
         "recent_events":      0,
         "best_route_id":      result["routes"][0]["id"] if result["routes"] else None,
         "generated_at":       now_iso(),
+        "mode":               mode,
     }
 
 
@@ -623,7 +673,13 @@ def fetch_disruptions(req: DisruptionRequest):
                 "matched_events": [], "event_count": 0, "is_best": False,
             })
 
-    scored = [_score_route(r, events) for r in route_list]
+    # ── City-wide weather — fetched ONCE, applied equally to all routes ─────
+    # Weather is genuinely city-wide (monsoon rain, high winds, fog affect
+    # every road identically). Sampling per-route wastes API quota and produces
+    # nearly identical numbers. One representative sample is correct here.
+    city_weather = _fetch_city_weather(route_list)
+
+    scored = [_score_route(r, events, city_weather=city_weather) for r in route_list]
     best_i = _pick_best_route(scored) if scored else 0
     for i, r in enumerate(scored):
         r["is_best"] = (i == best_i)
@@ -660,6 +716,9 @@ def fetch_disruptions(req: DisruptionRequest):
         "destination":   req.destination,
         "src_coords":    None,
         "dst_coords":    None,
+        # City-wide weather context — same value shown for all routes
+        "city_weather":  city_weather,
+        "mode":          req.mode,
     }
 
 
