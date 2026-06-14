@@ -1,0 +1,10 @@
+[
+  {
+    "route_id": "AC12",
+    "type": "AC",
+    "stops": [
+      "howrah",
+      "esplanade"
+    ]
+  }
+]

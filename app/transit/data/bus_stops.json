@@ -1,0 +1,14 @@
+[
+  {
+    "id": "howrah",
+    "name": "Howrah Station",
+    "lat": 22.5850,
+    "lon": 88.3468
+  },
+  {
+    "id": "esplanade",
+    "name": "Esplanade",
+    "lat": 22.5726,
+    "lon": 88.3639
+  }
+]
