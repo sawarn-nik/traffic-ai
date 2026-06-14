@@ -3,7 +3,8 @@
 // ======================================================
 
 // ── Map init ────────────────────────────────────────────────────────────────
-const map = L.map('map', { center: [22.5726, 88.3639], zoom: 13, zoomControl: true });
+const map = L.map('map', { center: [22.5726, 88.3639], zoom: 13, zoomControl: false });
+L.control.zoom({ position: 'bottomleft' }).addTo(map);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenStreetMap', maxZoom: 19
 }).addTo(map);
@@ -29,19 +30,30 @@ let overlayLayers   = [];          // metro line/station overlay
 let currentRoutes   = [];
 let activeIdx       = 0;
 let currentMode     = 'drive';
+let currentComboMode = '';
 let disruptionsLoaded   = false;
 let lastDisruptionData  = null;
 
 // ── Mode selector ────────────────────────────────────────────────────────────
 function setMode(mode) {
-  currentMode = mode;
+  if (mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive') {
+    currentMode = 'metro';
+    currentComboMode = mode;
+  } else {
+    currentMode = mode;
+    currentComboMode = '';
+  }
+
   document.querySelectorAll('.mode-tab').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.mode === mode);
   });
 
-  // Show/hide metro overlay toggle with legend
-  if (mode === 'metro') {
+  // Update input placeholders for the new mode
+  _syncPlaceholders(mode.startsWith('metro') ? 'metro' : mode);
+
+  if (mode === 'metro' || mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive') {
     loadMetroOverlay();
+    document.getElementById('map-legend').classList.add('visible');
   } else {
     clearOverlay();
     document.getElementById('map-legend').classList.remove('visible');
@@ -49,20 +61,194 @@ function setMode(mode) {
 }
 
 // ── Load locations ───────────────────────────────────────────────────────────
+let _allLocations  = [];   // {id, name, desc}
+let _metroStations = [];   // {id, name, desc, line, color}
+
+// Current confirmed values (what was actually selected, not just typed)
+let _srcValue = '';
+let _dstValue = '';
+
 async function loadLocations() {
   try {
     const data = await (await fetch('/api/locations')).json();
-    ['src-sel', 'dst-sel'].forEach(id => {
-      const sel = document.getElementById(id);
-      data.locations.forEach(loc => sel.appendChild(new Option(loc.name, loc.name)));
+    _allLocations  = data.locations      || [];
+    _metroStations = data.metro_stations || [];
+    console.log(`[locations] ${_allLocations.length} localities, ${_metroStations.length} metro stations loaded`);
+    _syncPlaceholders(currentMode);
+  } catch(e) {
+    console.error('[locations] fetch failed:', e);
+    toast('Unable to load locations');
+  }
+}
+
+function _syncPlaceholders(mode) {
+  document.getElementById('src-input').placeholder =
+    mode === 'metro' ? 'Source metro station' : 'Source location or station';
+  document.getElementById('dst-input').placeholder =
+    mode === 'metro' ? 'Destination metro station' : 'Destination location or station';
+}
+
+// Build the flat option list for a given mode
+function _buildOptions(mode) {
+  const opts = [];
+
+  if (mode !== 'metro') {
+    // Localities group
+    opts.push({ _group: '📍 Kolkata Localities' });
+    _allLocations.forEach(l => opts.push({ name: l.name, desc: l.desc, type: 'locality' }));
+  }
+
+  // Metro stations grouped by line
+  const LINE_META = {
+    blue:   { label: '🔵 Blue Line (North–South)',          color: '#2196F3' },
+    green:  { label: '🟢 Green Line (East–West)',            color: '#4CAF50' },
+    purple: { label: '🟣 Purple Line (Joka–Majerhat)',       color: '#9C27B0' },
+    orange: { label: '🟠 Orange Line (Kavi Subhash–Beleghata)', color: '#FF9800' },
+    yellow: { label: '🟡 Yellow Line (Noapara–Jai Hind)',    color: '#FFC107' },
+  };
+  const lineOrder = ['blue', 'green', 'purple', 'orange', 'yellow'];
+
+  lineOrder.forEach(line => {
+    const stns = _metroStations.filter(s => s.line === line);
+    if (!stns.length) return;
+    opts.push({ _group: LINE_META[line]?.label || line });
+    stns.forEach(s => opts.push({
+      name:  s.name,
+      desc:  s.desc,
+      type:  'metro',
+      line:  s.line,
+      color: s.color || LINE_META[line]?.color || '#888',
+    }));
+  });
+
+  return opts;
+}
+
+// Render the dropdown list, optionally filtered by query
+function _renderDropdown(which, query) {
+  const dd   = document.getElementById(`${which}-dropdown`);
+  const mode = currentMode;
+  const opts = _buildOptions(mode);
+  const q    = (query || '').toLowerCase().trim();
+
+  dd.innerHTML = '';
+
+  // Show loading state if data hasn't arrived yet
+  if (_allLocations.length === 0 && _metroStations.length === 0) {
+    const loading = document.createElement('div');
+    loading.className = 'loc-opt';
+    loading.style.color = '#9aa0a6';
+    loading.innerHTML = '<span class="loc-opt-pin">⏳</span><span>Loading locations…</span>';
+    dd.appendChild(loading);
+    return;
+  }
+
+  let anyResult = false;
+  let pendingGroup = null;
+
+  opts.forEach(opt => {
+    if (opt._group) {
+      pendingGroup = opt._group;
+      return;
+    }
+    if (q && !opt.name.toLowerCase().includes(q)) return;
+
+    // Flush the group header if this is the first item in the group
+    if (pendingGroup) {
+      const hdr = document.createElement('div');
+      hdr.className = 'loc-grp-label';
+      hdr.textContent = pendingGroup;
+      dd.appendChild(hdr);
+      pendingGroup = null;
+    }
+
+    anyResult = true;
+    const row = document.createElement('div');
+    row.className = 'loc-opt';
+    row.dataset.value = opt.name;
+
+    if (opt.type === 'metro') {
+      row.innerHTML = `
+        <span class="loc-opt-dot" style="background:${opt.color}"></span>
+        <span>${opt.name}</span>`;
+    } else {
+      row.innerHTML = `
+        <span class="loc-opt-pin">📍</span>
+        <span>${opt.name}</span>`;
+    }
+
+    row.addEventListener('mousedown', (e) => {
+      e.preventDefault();   // prevent blur firing before click
+      selectOption(which, opt.name);
     });
-  } catch { toast('Unable to load locations'); }
+
+    dd.appendChild(row);
+  });
+
+  if (!anyResult) {
+    const empty = document.createElement('div');
+    empty.className = 'loc-opt';
+    empty.style.color = '#9aa0a6';
+    empty.textContent = q ? `No matches for "${q}"` : 'No locations available';
+    dd.appendChild(empty);
+  }
+}
+
+function openDropdown(which) {
+  const input = document.getElementById(`${which}-input`);
+  const dd    = document.getElementById(`${which}-dropdown`);
+
+  // Position the fixed dropdown under the input
+  const rect = input.getBoundingClientRect();
+  dd.style.top   = (rect.bottom + 6) + 'px';
+  dd.style.left  = rect.left + 'px';
+  dd.style.width = Math.max(rect.width + 28, 340) + 'px';  // a bit wider than input
+
+  _renderDropdown(which, input.value);
+  dd.classList.add('open');
+}
+
+function closeDropdown(which, delay = 0) {
+  setTimeout(() => {
+    const dd = document.getElementById(`${which}-dropdown`);
+    dd.classList.remove('open');
+    // If input text doesn't match a confirmed value, revert it
+    const input = document.getElementById(`${which}-input`);
+    const val   = which === 'src' ? _srcValue : _dstValue;
+    if (input.value.trim() !== val) input.value = val;
+  }, delay);
+}
+
+function filterDropdown(which) {
+  const input = document.getElementById(`${which}-input`);
+  const dd    = document.getElementById(`${which}-dropdown`);
+
+  // Reposition in case the topbar shifted
+  const rect = input.getBoundingClientRect();
+  dd.style.top   = (rect.bottom + 6) + 'px';
+  dd.style.left  = rect.left + 'px';
+  dd.style.width = Math.max(rect.width + 28, 340) + 'px';
+
+  _renderDropdown(which, input.value);
+  dd.classList.add('open');
+  // Clear the confirmed value while typing
+  if (which === 'src') _srcValue = '';
+  else _dstValue = '';
+}
+
+function selectOption(which, name) {
+  document.getElementById(`${which}-input`).value = name;
+  document.getElementById(`${which}-dropdown`).classList.remove('open');
+  if (which === 'src') _srcValue = name;
+  else _dstValue = name;
 }
 
 function swapLocations() {
-  const s = document.getElementById('src-sel');
-  const d = document.getElementById('dst-sel');
-  [s.value, d.value] = [d.value, s.value];
+  const tmp = _srcValue;
+  _srcValue = _dstValue;
+  _dstValue = tmp;
+  document.getElementById('src-input').value = _srcValue;
+  document.getElementById('dst-input').value = _dstValue;
 }
 
 // ── Metro overlay ────────────────────────────────────────────────────────────
@@ -83,7 +269,7 @@ function drawMetroOverlay(geojson) {
     if (f.geometry.type === 'LineString') {
       const color = f.properties.color || '#9c27b0';
       const layer = L.geoJSON(f, {
-        style: { color, weight: 4, opacity: 0.8, dashArray: null }
+        style: { color, weight: 4, opacity: 0.85, dashArray: null }
       }).addTo(map);
       layer.bindTooltip(f.properties.name, { permanent: false });
       overlayLayers.push(layer);
@@ -94,10 +280,74 @@ function drawMetroOverlay(geojson) {
         radius: 5, color: '#fff', weight: 1.5,
         fillColor: color, fillOpacity: 1,
       }).addTo(map);
-      mk.bindPopup(
-        `<b>🚇 ${f.properties.name}</b><br>` +
-        `<span style="color:${color}">${f.properties.line === 'blue' ? 'Blue Line' : 'Green Line'}</span>`
-      );
+
+      // Click station → fetch next trains
+      const stnName = f.properties.name;
+      const lineName = f.properties.line;
+      mk.bindPopup(`<div style="min-width:200px">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <div style="background:${color};width:10px;height:10px;border-radius:50%"></div>
+          <b style="font-size:13px">${stnName}</b>
+        </div>
+        <div style="font-size:11px;color:${color};font-weight:600;margin-bottom:8px">
+          ${lineName.charAt(0).toUpperCase() + lineName.slice(1)} Line
+        </div>
+        <div id="nt_${stnName.replace(/\s+/g,'_')}" style="font-size:12px;color:#555">
+          <div style="display:flex;align-items:center;gap:6px;color:#9aa0a6">
+            <div class="spinner" style="width:12px;height:12px;border-width:2px"></div>
+            Loading next trains…
+          </div>
+        </div></div>`);
+
+      mk.on('popupopen', async () => {
+        const divId = `nt_${stnName.replace(/\s+/g,'_')}`;
+        try {
+          const res  = await fetch(`/api/next-metro/${encodeURIComponent(stnName)}?n=4`);
+          const div  = document.getElementById(divId);
+          if (!div) return;
+
+          if (!res.ok) {
+            // 404 = no trains at this station right now
+            const err = await res.json().catch(() => ({}));
+            div.innerHTML = `<div style="color:#e37400;font-size:11px">⚠ ${err.detail || 'No service now'}</div>`;
+            return;
+          }
+
+          const data = await res.json();
+          if (!data.trains || data.trains.length === 0) {
+            div.innerHTML = '<div style="color:#e37400;font-size:11px">⚠ No trains running now</div>';
+            return;
+          }
+
+          // Group by line+direction for cleaner display
+          const rows = data.trains.slice(0, 4).map(t => {
+            const away = t.minutes_away === 0
+              ? '<span style="color:#34a853;font-weight:700">Now</span>'
+              : `<span style="font-weight:700">${t.minutes_away} min</span>`;
+            const dir  = t.direction === 'a_to_b' ? '→' : '←';
+            return `
+            <div style="display:flex;align-items:center;gap:6px;margin:4px 0;font-size:12px">
+              <span style="background:${t.color};color:#fff;border-radius:4px;padding:1px 5px;
+                font-size:10px;font-weight:700;min-width:16px;text-align:center">
+                ${t.line.charAt(0).toUpperCase()}
+              </span>
+              <span style="flex:1;color:#202124">${dir} ${t.terminus}</span>
+              <span style="color:#5f6368">${t.departure_time}</span>
+              ${away}
+            </div>`;
+          }).join('');
+
+          div.innerHTML = `
+            <div style="color:#80868b;font-size:10px;margin-bottom:4px">
+              Next trains · ${data.queried_at}
+            </div>
+            ${rows}`;
+        } catch (e) {
+          const div = document.getElementById(divId);
+          if (div) div.innerHTML = '<i style="color:#9aa0a6">Could not load</i>';
+        }
+      });
+
       overlayLayers.push(mk);
     }
   });
@@ -110,8 +360,8 @@ function clearOverlay() {
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 async function go() {
-  const src = document.getElementById('src-sel').value;
-  const dst = document.getElementById('dst-sel').value;
+  const src = _srcValue.trim();
+  const dst = _dstValue.trim();
   if (!src || !dst) { toast('Select source and destination'); return; }
   if (src === dst)  { toast('Source and destination cannot be the same'); return; }
 
@@ -129,10 +379,16 @@ async function go() {
   // ── Step 1: routes ───────────────────────────────────────────────────────
   let routeData;
   try {
+    const payload = { source: src, destination: dst };
+    if (currentComboMode) {
+      payload.modes = currentComboMode.split('+');
+    } else {
+      payload.mode = currentMode;
+    }
     const res = await fetch('/api/route', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: src, destination: dst, mode: currentMode }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Routing failed'); }
     routeData = await res.json();
@@ -147,20 +403,25 @@ async function go() {
   renderPanel(currentRoutes, [], false, null, src, dst);
   setBtn(false, 'Get Routes');
 
-  // Metro: no disruption analysis needed — show journey detail immediately
-  if (currentMode === 'metro') {
-    setStatus(`${src} → ${dst} · Metro route`);
+  const isMetroCombo = currentComboMode.startsWith('metro+');
+
+  // Metro-only: no disruption analysis needed — show journey detail immediately
+  if (currentMode === 'metro' && !isMetroCombo) {
+    const comboLabels = { 'metro+walk': 'Metro+Walk', 'metro+bike': 'Metro+Bike', 'metro+drive': 'Metro+Drive' };
+    const modeStr = comboLabels[currentComboMode] || 'Metro';
+    setStatus(`${src} → ${dst} · ${modeStr} route`);
     return;
   }
 
-  // ── Step 2: disruptions (drive/walk/bike) ────────────────────────────────
+  // ── Step 2: disruptions (drive/walk/bike or metro+walk/bike) ───────────
   setStatus('Fetching disruptions…');
   try {
     const res = await fetch('/api/disruptions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        source: src, destination: dst, mode: currentMode,
+        source: src, destination: dst,
+        mode: currentComboMode || currentMode,
         road_names: routeData.all_road_names || [],
         routes:     routeData.routes,
       }),
@@ -195,22 +456,51 @@ function drawRoutes(data) {
 
   data.routes.forEach((route, i) => {
     const isActive = i === activeIdx;
-    const color    = route.risk_color || MODE_COLOR[mode] || ROUTE_PALETTE[i % 5];
-
-    // Metro route: dashed purple to distinguish from road layers
-    const dash = (mode === 'metro') ? '6 4' : (isActive ? null : '8 5');
+    const baseColor = route.risk_color || MODE_COLOR[mode] || ROUTE_PALETTE[i % 5];
     const w    = isActive ? 7 : 4;
     const op   = isActive ? 1 : 0.45;
 
-    const layer = L.geoJSON(route.geojson, {
-      style: { color, weight: w, opacity: op, dashArray: dash, lineJoin: 'round', lineCap: 'round' }
-    }).addTo(map);
+    // Multi-segment GeoJSON (metro+feeder): each feature has its own colour
+    const hasSegmentColors = route.geojson &&
+      route.geojson.features &&
+      route.geojson.features.some(f => f.properties && f.properties.color);
 
-    layer.on('click', () => selectRoute(i));
-    layer.bindTooltip(
-      `<b>${route.label}</b><br>${route.distance_km} km · ${route.travel_time_min} min`,
-      { sticky: true }
-    );
+    let layer;
+    if (hasSegmentColors) {
+      // Render each feature with its own segment colour
+      const featureGroup = L.featureGroup();
+      route.geojson.features.forEach(f => {
+        const segColor = f.properties.color || baseColor;
+        const segDash  = f.properties.segment === 'metro' ? null : (isActive ? '6 4' : '8 5');
+        const segW     = f.properties.segment === 'metro' ? w + 1 : w - 1;
+        const segOp    = isActive ? 1 : 0.45;
+        const segLayer = L.geoJSON(f, {
+          style: { color: segColor, weight: segW, opacity: segOp,
+                   dashArray: segDash, lineJoin: 'round', lineCap: 'round' }
+        });
+        featureGroup.addLayer(segLayer);
+      });
+      featureGroup.addTo(map);
+      featureGroup.on('click', () => selectRoute(i));
+      featureGroup.bindTooltip(
+        `<b>${route.label}</b><br>${route.distance_km} km · ${route.travel_time_min} min`,
+        { sticky: true }
+      );
+      layer = featureGroup;
+    } else {
+      // Standard single-colour route
+      const dash = (mode === 'metro') ? '6 4' : (isActive ? null : '8 5');
+      layer = L.geoJSON(route.geojson, {
+        style: { color: baseColor, weight: w, opacity: op,
+                 dashArray: dash, lineJoin: 'round', lineCap: 'round' }
+      }).addTo(map);
+      layer.on('click', () => selectRoute(i));
+      layer.bindTooltip(
+        `<b>${route.label}</b><br>${route.distance_km} km · ${route.travel_time_min} min`,
+        { sticky: true }
+      );
+    }
+
     routeLayers.push(layer);
   });
 
@@ -219,22 +509,58 @@ function drawRoutes(data) {
   if (dc) pinLayers.push(L.marker([dc[0], dc[1]], { icon: pin('🔴') }).addTo(map).bindPopup(`<b>End</b><br>${data.destination}`));
 
   if (routeLayers[activeIdx]) {
-    map.fitBounds(routeLayers[activeIdx].getBounds(), { padding: [50, 50] });
+    // paddingTopLeft: leave room for search card (left) + some top margin
+    // paddingBottomRight: leave room for route panel (right) + status bar
+    map.fitBounds(routeLayers[activeIdx].getBounds(), {
+      paddingTopLeft:     [380, 60],
+      paddingBottomRight: [360, 60],
+    });
     routeLayers[activeIdx].bringToFront();
   }
 }
 
 function updateRouteColors(routes) {
+  const mode = currentComboMode || currentMode;
   routes.forEach((r, i) => {
     if (!routeLayers[i]) return;
     const isActive = i === activeIdx;
-    routeLayers[i].setStyle({
-      color:     r.risk_color || MODE_COLOR[currentMode] || ROUTE_PALETTE[i % 5],
-      weight:    isActive ? 7 : 4,
-      opacity:   isActive ? 1 : 0.4,
-      dashArray: isActive ? null : '8 5',
-    });
-    if (isActive) routeLayers[i].bringToFront();
+    const baseColor = r.risk_color || MODE_COLOR[currentMode] || ROUTE_PALETTE[i % 5];
+
+    // FeatureGroup (multi-segment) — restyle each child layer
+    if (routeLayers[i].eachLayer) {
+      routeLayers[i].eachLayer(child => {
+        if (child.setStyle) {
+          const segColor = child.feature?.properties?.color || baseColor;
+          child.setStyle({
+            color:     segColor,
+            weight:    isActive ? 7 : 4,
+            opacity:   isActive ? 1 : 0.4,
+            dashArray: isActive ? null : '8 5',
+          });
+        } else if (child.eachLayer) {
+          // nested feature group
+          child.eachLayer(grandchild => {
+            if (grandchild.setStyle) {
+              const sc = grandchild.feature?.properties?.color || baseColor;
+              grandchild.setStyle({
+                color:     sc,
+                weight:    isActive ? 7 : 4,
+                opacity:   isActive ? 1 : 0.4,
+                dashArray: isActive ? null : '8 5',
+              });
+            }
+          });
+        }
+      });
+    } else if (routeLayers[i].setStyle) {
+      routeLayers[i].setStyle({
+        color:     baseColor,
+        weight:    isActive ? 7 : 4,
+        opacity:   isActive ? 1 : 0.4,
+        dashArray: isActive ? null : '8 5',
+      });
+    }
+    if (isActive && routeLayers[i].bringToFront) routeLayers[i].bringToFront();
   });
 }
 
@@ -258,7 +584,12 @@ function drawMarkers(markers) {
 
 // ── Panel rendering ───────────────────────────────────────────────────────────
 function renderLoading(src, dst, mode) {
-  const modeLabel = MODE_LABEL[mode] || mode;
+  const comboLabels = {
+    'metro+walk':  '🚇+🚶 Metro+Walk',
+    'metro+bike':  '🚇+🚲 Metro+Bike',
+    'metro+drive': '🚇+🚗 Metro+Drive',
+  };
+  const modeLabel = comboLabels[currentComboMode] || MODE_LABEL[mode] || mode;
   document.getElementById('panel').innerHTML = `
     <div class="sec-lbl">${modeLabel} Routes</div>
     <div class="loading-row">
@@ -273,8 +604,13 @@ function renderError(msg) {
 }
 
 function renderPanel(routes, markers, ready, weather, src, dst) {
-  const mode  = currentMode;
-  const mLabel = MODE_LABEL[mode] || mode;
+  const mode  = currentComboMode || currentMode;
+  const comboLabels = {
+    'metro+walk':  '🚇+🚶 Metro+Walk',
+    'metro+bike':  '🚇+🚲 Metro+Bike',
+    'metro+drive': '🚇+🚗 Metro+Drive',
+  };
+  const mLabel = comboLabels[mode] || MODE_LABEL[currentMode] || currentMode;
 
   let html = '';
   const note = (ready || mode === 'metro')
@@ -292,7 +628,8 @@ function renderPanel(routes, markers, ready, weather, src, dst) {
     html += buildWeatherBanner(weather);
   }
 
-  // Disruption loading row
+  // Disruption loading row — skip for pure metro (no disruption analysis),
+  // but show for metro+walk/bike/drive combos which do run disruption analysis.
   if (!ready && mode !== 'metro') {
     html += `
     <div class="divider"></div>
@@ -312,13 +649,20 @@ function buildRouteCard(r, i, ready, markers, mode) {
   const riskLevel = r.risk_level || '';
   const riskColor = RISK_COLOR[riskLevel] || '#80868b';
   const evtCount  = r.event_count || 0;
-  const modeColor = MODE_COLOR[mode] || '#1a73e8';
+  const modeColor = MODE_COLOR[currentMode] || '#1a73e8';
 
-  // Event count strip (drive/bike only)
+  // Event count strip
+  // Pure metro: no disruption analysis — just label it
+  // Metro combos (metro+walk/bike/drive): DO run disruption analysis, show results
+  // Walk: show as walking route (low relevance for disruptions)
   let evtClass = '', evtIcon = '', evtText = '';
-  if (mode === 'metro' || mode === 'walk') {
+  const isPureMetro  = mode === 'metro';
+  const isMetroCombo = mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive';
+  if (isPureMetro) {
     evtClass = 'ok'; evtIcon = '✓';
-    evtText  = mode === 'metro' ? 'Metro route' : 'Walking route';
+    evtText  = 'Metro route';
+  } else if (mode === 'walk') {
+    evtClass = 'ok'; evtIcon = '✓'; evtText = 'Walking route';
   } else if (!ready) {
     evtIcon = '⏳'; evtText = 'Analysing…';
   } else if (evtCount === 0) {
@@ -331,9 +675,12 @@ function buildRouteCard(r, i, ready, markers, mode) {
 
   // Subtitle
   let subtitle = '';
-  if (mode === 'metro' && r.segments) {
+  if ((isPureMetro || isMetroCombo) && r.segments) {
     const metro = r.segments.find(s => s.type === 'metro');
-    subtitle = metro ? `${metro.from} → ${metro.to}` : 'Metro + Walk';
+    const feederLabel = isMetroCombo
+      ? mode.split('+')[1].charAt(0).toUpperCase() + mode.split('+')[1].slice(1)
+      : 'Walk';
+    subtitle = metro ? `${metro.from} → ${metro.to}` : `Metro + ${feederLabel}`;
   } else {
     subtitle = 'via ' + ((r.road_names || []).slice(0, 2).join(', ') || 'city roads');
   }
@@ -351,7 +698,7 @@ function buildRouteCard(r, i, ready, markers, mode) {
         <div class="rc-subtitle">${subtitle}</div>
       </div>
       ${isBest ? '<div class="best-badge">Best</div>' : ''}
-      ${(ready && riskLevel && mode !== 'metro')
+      ${(ready && riskLevel && !isPureMetro)
         ? `<div class="risk-pill" style="background:${riskColor}18;color:${riskColor}">${riskLevel}</div>`
         : ''}
     </div>
@@ -359,17 +706,17 @@ function buildRouteCard(r, i, ready, markers, mode) {
     <div class="rc-stats">
       <div class="stat-chip">${r.travel_time_min}<span class="lbl"> min</span></div>
       <div class="stat-chip">${r.distance_km}<span class="lbl"> km</span></div>
-      ${(ready && riskLevel && mode !== 'metro')
+      ${(ready && riskLevel && !isPureMetro)
         ? `<div class="stat-chip" style="color:${riskColor}">${r.risk_score || 0}<span class="lbl" style="color:${riskColor}99"> risk</span></div>`
         : ''}
     </div>
 
-    ${mode !== 'metro' ? `<div class="rc-roads">${roadsText}</div>` : ''}
+    ${!isPureMetro ? `<div class="rc-roads">${roadsText}</div>` : ''}
     <div class="rc-events ${evtClass}">${evtIcon} ${evtText}</div>`;
 
   // Expanded detail for the active card
   if (isActive) {
-    if (mode === 'metro') {
+    if (isPureMetro || isMetroCombo) {
       html += buildMetroJourney(r);
     } else {
       html += buildExpandedDetail(r, ready);
@@ -395,7 +742,7 @@ function buildMetroJourney(r) {
 
   segments.forEach((seg, i) => {
     const isMetro = seg.type === 'metro';
-    const icon = isMetro ? '🚇' : (currentMode === 'bike' ? '🚲' : '🚶');
+    const icon = isMetro ? '🚇' : (seg.type === 'bike' ? '🚲' : seg.type === 'drive' ? '🚗' : '🚶');
     const lineClass = isMetro
       ? `<span class="metro-line-pill ${seg.line || 'blue'}">${(seg.line || 'blue').toUpperCase()} LINE</span>`
       : '';
@@ -409,6 +756,16 @@ function buildMetroJourney(r) {
         const midStops = stops.slice(1, -1).join(', ');
         detail += `<br><small style="color:#9aa0a6">${midStops}</small>`;
       }
+      // Next train chip
+      if (seg.next_train) {
+        const nt = seg.next_train;
+        const away = nt.minutes_away === 0
+          ? '<span style="color:#34a853">Departing now</span>'
+          : `<span style="color:#1a73e8">Boards in ${nt.minutes_away} min</span>`;
+        detail += `<br><div style="margin-top:4px;font-size:11px">
+          🚇 Next: <b>${nt.departure_time}</b> · ${away}
+        </div>`;
+      }
     } else {
       detail = `${seg.from} → ${seg.to} · ${seg.distance_km} km`;
     }
@@ -420,19 +777,28 @@ function buildMetroJourney(r) {
         ${!isLast(i) ? `<div class="seg-connector ${seg.type}"></div>` : ''}
       </div>
       <div class="seg-body">
-        <div class="seg-title">${isMetro ? 'Metro' : 'Walk'} ${lineClass}</div>
+        <div class="seg-title">${isMetro ? 'Metro' : (seg.type === 'bike' ? 'Bike' : seg.type === 'drive' ? 'Drive' : 'Walk')} ${lineClass}</div>
         <div class="seg-detail">${detail}</div>
         <div class="seg-time-chip">${seg.time_min} min · ${seg.distance_km} km</div>
       </div>
     </div>`;
   });
 
-  // Interchange note
-  if (r.interchange) {
+  // Interchange note — uses the dynamic note from the backend (e.g. "Change at Esplanade")
+  if (r.interchange && r.interchange_note) {
     html += `
     <div class="metro-note-banner">
-      🔄 Interchange at Esplanade — change between Blue and Green Line
+      🔄 ${r.interchange_note}
     </div>`;
+  }
+
+  // Disruption flags from context-aware routing
+  if (r.disruption_flags && r.disruption_flags.length > 0) {
+    r.disruption_flags.forEach(flag => {
+      html += `<div class="metro-note-banner" style="background:#fce8e6;border-color:#ea4335;color:#c5221f">
+        ⚠️ ${flag}
+      </div>`;
+    });
   }
 
   // Metro note
@@ -549,7 +915,10 @@ function selectRoute(i) {
   activeIdx = i;
   updateRouteColors(currentRoutes);
   if (routeLayers[i]) {
-    map.fitBounds(routeLayers[i].getBounds(), { padding: [50, 50] });
+    map.fitBounds(routeLayers[i].getBounds(), {
+      paddingTopLeft:     [380, 60],
+      paddingBottomRight: [360, 60],
+    });
     routeLayers[i].bringToFront();
   }
   renderPanel(
@@ -557,8 +926,8 @@ function selectRoute(i) {
     lastDisruptionData?.markers || [],
     disruptionsLoaded,
     lastDisruptionData?.city_weather || null,
-    document.getElementById('src-sel').value,
-    document.getElementById('dst-sel').value,
+    _srcValue,
+    _dstValue,
   );
 }
 
