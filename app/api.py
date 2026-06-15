@@ -17,6 +17,7 @@ Run with:
 
 import sys
 import os
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -27,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from routing.route_engine import get_multiple_routes
-from routing.multimodal import get_routes_for_mode, get_metro_geojson_overlay
+from routing.multimodal import get_routes_for_mode, get_routes_for_modes, get_metro_geojson_overlay
 from ingestion.rss_fetcher import fetch_rss_for_query, fetch_kolkata_city_feeds
 from ingestion.news_fetcher import fetch_news
 from ingestion.tomtom_fetcher import fetch_tomtom_incidents
@@ -157,6 +158,7 @@ class RouteRequest(BaseModel):
     source:      str
     destination: str
     mode:        str = "drive"   # drive | walk | bike | metro
+    modes:       list[str] | None = None  # ['metro','walk'] or ['metro','bike']
 
 
 class RouteSummary(BaseModel):
@@ -864,7 +866,31 @@ async def startup():
 
 @app.get("/api/locations")
 def get_locations():
-    return {"locations": KOLKATA_LOCATIONS}
+    from routing.metro_timetable import ALL_LINES
+
+    # Collect all unique metro station names, preserving display order:
+    # Blue → Green → Purple → Orange → Yellow
+    seen_metro: set[str] = set()
+    metro_locations = []
+    _id = len(KOLKATA_LOCATIONS) + 1
+    for line in ALL_LINES:
+        for stn in line.stations:
+            if stn.lower() not in seen_metro:
+                seen_metro.add(stn.lower())
+                metro_locations.append({
+                    "id":   _id,
+                    "name": stn,
+                    "desc": f"{line.display_name} station",
+                    "type": "metro",
+                    "line": line.line,
+                    "color": line.color_hex,
+                })
+                _id += 1
+
+    return {
+        "locations": KOLKATA_LOCATIONS,
+        "metro_stations": metro_locations,
+    }
 
 
 @app.get("/api/metro-overlay")
@@ -938,6 +964,36 @@ def explain_route(req: DisruptionRequest):
     }
 
 
+@app.get("/api/metro-lines")
+def metro_lines_summary():
+    """Summary of all metro lines — first/last trains, frequency, stations."""
+    from routing.metro_timetable import get_all_lines_summary
+    return {"lines": get_all_lines_summary()}
+
+
+@app.get("/api/next-metro/{station_name}")
+def next_metro(station_name: str, n: int = 4):
+    """
+    Return the next n trains at a station across all lines and directions.
+    Uses current IST time on the server.
+
+    Returns 404 if no trains are found (no service / outside operating hours).
+    Example: GET /api/next-metro/Esplanade?n=4
+    """
+    from routing.metro_timetable import next_trains_at_station, IST
+    now    = datetime.now(tz=IST)
+    result = next_trains_at_station(station_name, now=now, n=n)
+    if not result["trains"]:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No upcoming trains at '{station_name}' right now. "
+                "Service may have ended for the day, or the station name may not match."
+            )
+        )
+    return result
+
+
 @app.post("/api/route")
 def compute_routes_only(req: RouteRequest):
     """
@@ -945,13 +1001,20 @@ def compute_routes_only(req: RouteRequest):
     Computes routes for the requested mode. Metro uses static station data.
     All routes get placeholder risk=LOW/score=0 until /api/disruptions runs.
     """
-    mode = req.mode or "drive"
+    modes = req.modes if req.modes is not None else [req.mode or "drive"]
+    if not modes:
+        raise HTTPException(status_code=400, detail="At least one transport mode must be provided.")
     try:
-        result = get_routes_for_mode(req.source, req.destination, mode)  # type: ignore
+        if len(modes) == 1:
+            result = get_routes_for_mode(req.source, req.destination, modes[0])  # type: ignore
+        else:
+            result = get_routes_for_modes(req.source, req.destination, modes)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Routing error: {e}")
+
+    mode = result.get("mode") or (modes[0] if len(modes) == 1 else "+".join(modes))
 
     # Mode-specific colours for route lines
     MODE_COLOR = {
@@ -959,6 +1022,9 @@ def compute_routes_only(req: RouteRequest):
         "walk":  "#34a853",
         "bike":  "#fbbc04",
         "metro": "#9c27b0",
+        "metro+walk":  "#9c27b0",
+        "metro+bike":  "#9c27b0",
+        "metro+drive": "#9c27b0",
     }
     base_color = MODE_COLOR.get(mode, "#1a73e8")
 
@@ -1086,10 +1152,30 @@ def fetch_disruptions(req: DisruptionRequest):
                 "matched_events": [], "event_count": 0, "is_best": False,
             })
 
+    # ── Context-aware re-routing for metro/multimodal modes ───────────────────
+    # Now that we have extracted events, re-run the metro routing with full
+    # disruption context so blocked stations and path scores use real data.
+    req_mode = req.mode or "drive"
+    is_metro_mode = req_mode in ("metro", "metro+walk", "metro+bike", "metro+drive")
+    if is_metro_mode and events:
+        try:
+            print(f"  [API] Re-routing {req_mode} with {len(events)} disruption events for context")
+            modes_for_reroute = req_mode.split("+")
+            if len(modes_for_reroute) == 1:
+                rerouted = get_routes_for_mode(
+                    req.source, req.destination, modes_for_reroute[0], events=events
+                )
+            else:
+                rerouted = get_routes_for_modes(
+                    req.source, req.destination, modes_for_reroute, events=events
+                )
+            # Replace route_list with context-aware routes
+            route_list = rerouted.get("routes", route_list)
+            print(f"  [API] Context-aware re-routing produced {len(route_list)} routes")
+        except Exception as e:
+            print(f"  [API] Context-aware re-routing failed, using original routes: {e}")
+
     # ── City-wide weather — fetched ONCE, applied equally to all routes ─────
-    # Weather is genuinely city-wide (monsoon rain, high winds, fog affect
-    # every road identically). Sampling per-route wastes API quota and produces
-    # nearly identical numbers. One representative sample is correct here.
     city_weather = _fetch_city_weather(route_list)
 
     cascade_cache: dict = {}

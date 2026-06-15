@@ -1,28 +1,13 @@
 """
 multimodal.py — Mode-aware routing for Kolkata Traffic AI
 ==========================================================
+Supports: drive | walk | bike | metro (all 5 Kolkata Metro lines)
 
-Supports four transport modes:
-
-  drive  — OSMnx drive network (existing graph.pkl)
-  walk   — OSMnx walk network  (graph_walk.pkl, lazy-downloaded)
-  bike   — OSMnx bike network  (graph_bike.pkl, lazy-downloaded)
-  metro  — Simplified metro model:
-             walk to nearest station → metro line → walk from station
-
-Metro model notes:
-  • Uses hardcoded Kolkata Metro Blue Line (Line 1) + Green Line (Line 2) stations
-    with real lat/lon coordinates.
-  • Walk legs use the OSMnx walk graph (or straight-line estimate if unavailable).
-  • Metro travel speed: 35 km/h average including dwell time.
-  • Walk speed: 5 km/h.
-  • This is a planning estimate — no real-time GTFS feed is used.
-
-Speed assumptions:
-  drive  → 30 km/h (Kolkata city average with traffic)
-  walk   → 5  km/h
-  bike   → 15 km/h
-  metro  → 35 km/h on metro segment + 5 km/h walk legs
+Multimodal improvements:
+  - Multi-interchange BFS path-finding (any number of line changes)
+  - Per-segment coloured GeoJSON (feeder road + metro tunnel geometry)
+  - Multiple route alternatives (vary boarding/alighting + feeder legs)
+  - Disruption context-awareness (metro closure events suppress stations)
 """
 
 from __future__ import annotations
@@ -30,86 +15,122 @@ from __future__ import annotations
 import os
 import pickle
 import math
+import re
+from collections import deque
+from datetime import datetime
 from typing import Literal
 
 import osmnx as ox
 
 from config import GRAPH_CACHE_PATH, MAX_ROUTES, MIN_ROUTE_DIVERGENCE, MAX_CONSECUTIVE_DUPES
 
-# ── Cache paths ───────────────────────────────────────────────────────────────
 _CACHE_DIR  = os.path.dirname(GRAPH_CACHE_PATH)
 _GRAPH_WALK = os.path.join(_CACHE_DIR, "graph_walk.pkl")
 _GRAPH_BIKE = os.path.join(_CACHE_DIR, "graph_bike.pkl")
 
 TransportMode = Literal["drive", "walk", "bike", "metro"]
 
-# Speed in km/h by mode (used for travel_time_min estimation)
 MODE_SPEED_KMH: dict[str, float] = {
-    "drive": 30.0,
-    "walk":  5.0,
-    "bike":  15.0,
-    "metro": 35.0,  # metro segment speed
+    "drive": 30.0, "walk": 5.0, "bike": 15.0, "metro": 35.0,
 }
 
-# ── Kolkata Metro station data ─────────────────────────────────────────────────
-# Blue Line (Line 1) — Dakshineswar ↔ New Garia
-# Green Line (Line 2) — Salt Lake Sector V ↔ Howrah Maidan  (partial, operational section)
-# Coords: (lat, lon)
+# ── All 5 metro lines — station coords ───────────────────────────────────────
 
 METRO_STATIONS: list[dict] = [
-    # Blue Line (Line 1) — N → S
-    {"id": "bl_dakshineswar",       "name": "Dakshineswar",         "lat": 22.6427, "lon": 88.3574, "line": "blue"},
-    {"id": "bl_baranagar",          "name": "Baranagar Road",       "lat": 22.6360, "lon": 88.3779, "line": "blue"},
-    {"id": "bl_noapara",            "name": "Noapara",              "lat": 22.6241, "lon": 88.3794, "line": "blue"},
-    {"id": "bl_dumdum",             "name": "Dum Dum",              "lat": 22.6169, "lon": 88.3969, "line": "blue"},
-    {"id": "bl_belgachia",          "name": "Belgachia",            "lat": 22.6085, "lon": 88.3846, "line": "blue"},
-    {"id": "bl_shyambazar",         "name": "Shyambazar",           "lat": 22.5997, "lon": 88.3744, "line": "blue"},
-    {"id": "bl_shobhabazar",        "name": "Shobhabazar Sutanuti", "lat": 22.5935, "lon": 88.3681, "line": "blue"},
-    {"id": "bl_girish_park",        "name": "Girish Park",          "lat": 22.5882, "lon": 88.3637, "line": "blue"},
-    {"id": "bl_mahatma_gandhi_rd",  "name": "Mahatma Gandhi Road",  "lat": 22.5847, "lon": 88.3600, "line": "blue"},
-    {"id": "bl_central",            "name": "Central",              "lat": 22.5802, "lon": 88.3558, "line": "blue"},
-    {"id": "bl_chandni_chowk",      "name": "Chandni Chowk",        "lat": 22.5741, "lon": 88.3523, "line": "blue"},
-    {"id": "bl_esplanade",          "name": "Esplanade",            "lat": 22.5664, "lon": 88.3506, "line": "blue"},
-    {"id": "bl_park_street",        "name": "Park Street",          "lat": 22.5546, "lon": 88.3521, "line": "blue"},
-    {"id": "bl_maidan",             "name": "Maidan",               "lat": 22.5498, "lon": 88.3436, "line": "blue"},
-    {"id": "bl_rabindra_sadan",     "name": "Rabindra Sadan",       "lat": 22.5438, "lon": 88.3443, "line": "blue"},
-    {"id": "bl_netaji_bhavan",      "name": "Netaji Bhavan",        "lat": 22.5381, "lon": 88.3456, "line": "blue"},
-    {"id": "bl_jatin_das_park",     "name": "Jatin Das Park",       "lat": 22.5322, "lon": 88.3460, "line": "blue"},
-    {"id": "bl_kalighat",           "name": "Kalighat",             "lat": 22.5249, "lon": 88.3436, "line": "blue"},
-    {"id": "bl_tollygunge",         "name": "Tollygunge",           "lat": 22.5143, "lon": 88.3461, "line": "blue"},
-    {"id": "bl_mahanayak",          "name": "Mahanayak Uttam Kumar","lat": 22.5021, "lon": 88.3462, "line": "blue"},
-    {"id": "bl_netaji",             "name": "Netaji",               "lat": 22.4921, "lon": 88.3477, "line": "blue"},
-    {"id": "bl_masterda",           "name": "Masterda Surya Sen",   "lat": 22.4845, "lon": 88.3479, "line": "blue"},
-    {"id": "bl_gitanjali",          "name": "Gitanjali",            "lat": 22.4773, "lon": 88.3479, "line": "blue"},
-    {"id": "bl_kavi_nazrul",        "name": "Kavi Nazrul",          "lat": 22.4699, "lon": 88.3479, "line": "blue"},
-    {"id": "bl_shahid_khudiram",    "name": "Shahid Khudiram",      "lat": 22.4627, "lon": 88.3481, "line": "blue"},
-    {"id": "bl_kavi_subhash",       "name": "Kavi Subhash",         "lat": 22.4552, "lon": 88.3494, "line": "blue"},
-    {"id": "bl_new_garia",          "name": "New Garia",            "lat": 22.4502, "lon": 88.3897, "line": "blue"},
+    # ── BLUE LINE (North-South, Line 1) ──────────────────────────────────────
+    {"id":"bl_dakshineswar",      "name":"Dakshineswar",         "lat":22.6536796,  "lon":88.36279,    "line":"blue"},
+    {"id":"bl_baranagar",         "name":"Baranagar Road",       "lat":22.6536402,  "lon":88.3736444,  "line":"blue"},
+    {"id":"bl_noapara",           "name":"Noapara",              "lat":22.6399176,  "lon":88.3940964,  "line":"blue"},
+    {"id":"bl_dumdum",            "name":"Dum Dum",              "lat":22.6214620,  "lon":88.3924889,  "line":"blue"},
+    {"id":"bl_belgachia",         "name":"Belgachia",            "lat":22.6060188,  "lon":88.3865456,  "line":"blue"},
+    {"id":"bl_shyambazar",        "name":"Shyambazar",           "lat":22.6007116,  "lon":88.3702820,  "line":"blue"},
+    {"id":"bl_shobhabazar",       "name":"Shobhabazar Sutanuti", "lat":22.5960748,  "lon":88.3652955,  "line":"blue"},
+    {"id":"bl_girish_park",       "name":"Girish Park",          "lat":22.5872207,  "lon":88.3630412,  "line":"blue"},
+    {"id":"bl_mg_road",           "name":"Mahatma Gandhi Road",  "lat":22.5808049,  "lon":88.3613813,  "line":"blue"},
+    {"id":"bl_central",           "name":"Central",              "lat":22.5725323,  "lon":88.3582318,  "line":"blue"},
+    {"id":"bl_chandni",           "name":"Chandni Chowk",        "lat":22.5666859,  "lon":88.3536634,  "line":"blue"},
+    {"id":"bl_esplanade",         "name":"Esplanade",            "lat":22.5648375,  "lon":88.3516199,  "line":"blue"},
+    {"id":"bl_park_street",       "name":"Park Street",          "lat":22.5544697,  "lon":88.3498285,  "line":"blue"},
+    {"id":"bl_maidan",            "name":"Maidan",               "lat":22.5494127,  "lon":88.3484939,  "line":"blue"},
+    {"id":"bl_rabindra_sadan",    "name":"Rabindra Sadan",       "lat":22.5413538,  "lon":88.3472950,  "line":"blue"},
+    {"id":"bl_netaji_bhavan",     "name":"Netaji Bhavan",        "lat":22.5331454,  "lon":88.3456480,  "line":"blue"},
+    {"id":"bl_jatin_das_park",    "name":"Jatin Das Park",       "lat":22.5243569,  "lon":88.3464894,  "line":"blue"},
+    {"id":"bl_kalighat",          "name":"Kalighat",             "lat":22.5167914,  "lon":88.3459603,  "line":"blue"},
+    {"id":"bl_tollygunge",        "name":"Tollygunge",           "lat":22.5078731,  "lon":88.3474928,  "line":"blue"},
+    {"id":"bl_mahanayak",         "name":"Mahanayak Uttam Kumar","lat":22.4945906,  "lon":88.3451752,  "line":"blue"},
+    {"id":"bl_netaji",            "name":"Netaji",               "lat":22.4810865,  "lon":88.3458921,  "line":"blue"},
+    {"id":"bl_masterda",          "name":"Masterda Surya Sen",   "lat":22.4736072,  "lon":88.3607502,  "line":"blue"},
+    {"id":"bl_gitanjali",         "name":"Gitanjali",            "lat":22.4695042,  "lon":88.3699437,  "line":"blue"},
+    {"id":"bl_kavi_nazrul",       "name":"Kavi Nazrul",          "lat":22.4643036,  "lon":88.3806582,  "line":"blue"},
+    {"id":"bl_shahid_khudiram",   "name":"Shahid Khudiram",      "lat":22.4661679,  "lon":88.3916762,  "line":"blue"},
 
-    # Green Line (Line 2) — operational section: Salt Lake Sector V ↔ Phoolbagan
-    {"id": "gl_salt_lake_sector_v", "name": "Salt Lake Sector V",   "lat": 22.5753, "lon": 88.4346, "line": "green"},
-    {"id": "gl_karunamoyee",        "name": "Karunamoyee",          "lat": 22.5743, "lon": 88.4264, "line": "green"},
-    {"id": "gl_central_park",       "name": "Central Park",         "lat": 22.5735, "lon": 88.4190, "line": "green"},
-    {"id": "gl_city_centre",        "name": "City Centre",          "lat": 22.5724, "lon": 88.4118, "line": "green"},
-    {"id": "gl_bengal_chemical",    "name": "Bengal Chemical",      "lat": 22.5715, "lon": 88.4027, "line": "green"},
-    {"id": "gl_salt_lake_stadium",  "name": "Salt Lake Stadium",    "lat": 22.5701, "lon": 88.3962, "line": "green"},
-    {"id": "gl_phoolbagan",         "name": "Phoolbagan",           "lat": 22.5694, "lon": 88.3893, "line": "green"},
-    {"id": "gl_sealdah",            "name": "Sealdah",              "lat": 22.5679, "lon": 88.3700, "line": "green"},
-    {"id": "gl_esplanade",          "name": "Esplanade (Green)",    "lat": 22.5664, "lon": 88.3506, "line": "green"},
-    {"id": "gl_mahakaran",          "name": "Mahakaran",            "lat": 22.5617, "lon": 88.3433, "line": "green"},
-    {"id": "gl_howrah_maidan",      "name": "Howrah Maidan",        "lat": 22.5840, "lon": 88.3283, "line": "green"},
+    # ── GREEN LINE (East-West, Line 2) ────────────────────────────────────────
+    {"id":"gl_howrah_maidan",     "name":"Howrah Maidan",        "lat":22.5835267,  "lon":88.3338090,  "line":"green"},
+    {"id":"gl_howrah",            "name":"Howrah",               "lat":22.5830362,  "lon":88.3410134,  "line":"green"},
+    {"id":"gl_mahakaran",         "name":"Mahakaran",            "lat":22.5725301,  "lon":88.3506717,  "line":"green"},
+    {"id":"gl_esplanade",         "name":"Esplanade",            "lat":22.5648375,  "lon":88.3516199,  "line":"green"},
+    {"id":"gl_sealdah",           "name":"Sealdah",              "lat":22.5665634,  "lon":88.3706984,  "line":"green"},
+    {"id":"gl_phoolbagan",        "name":"Phoolbagan",           "lat":22.5721820,  "lon":88.3902921,  "line":"green"},
+    {"id":"gl_sl_stadium",        "name":"Salt Lake Stadium",    "lat":22.5733536,  "lon":88.4035940,  "line":"green"},
+    {"id":"gl_bengal_chemical",   "name":"Bengal Chemical",      "lat":22.5801737,  "lon":88.4013465,  "line":"green"},
+    {"id":"gl_city_centre",       "name":"City Centre",          "lat":22.5910706,  "lon":88.4108739,  "line":"green"},
+    {"id":"gl_central_park",      "name":"Central Park",         "lat":22.5903855,  "lon":88.4154789,  "line":"green"},
+    {"id":"gl_karunamoyee",       "name":"Karunamoyee",          "lat":22.5864805,  "lon":88.4213914,  "line":"green"},
+    {"id":"gl_sl_sector_v",       "name":"Salt Lake Sector V",   "lat":22.5810776,  "lon":88.4290090,  "line":"green"},
+
+    # ── PURPLE LINE (Joka–Majerhat, Line 3) ──────────────────────────────────
+    {"id":"pl_joka",              "name":"Joka",                 "lat":22.4520677,  "lon":88.3015804,  "line":"purple"},
+    {"id":"pl_thakurpukur",       "name":"Thakurpukur",          "lat":22.4643386,  "lon":88.3074909,  "line":"purple"},
+    {"id":"pl_sakherbazar",       "name":"Sakherbazar",          "lat":22.4749579,  "lon":88.3099487,  "line":"purple"},
+    {"id":"pl_behala_chowrasta",  "name":"Behala Chowrasta",     "lat":22.4872187,  "lon":88.3132142,  "line":"purple"},
+    {"id":"pl_behala_bazar",      "name":"Behala Bazar",         "lat":22.5004968,  "lon":88.3177963,  "line":"purple"},
+    {"id":"pl_taratala",          "name":"Taratala",             "lat":22.5078226,  "lon":88.3203432,  "line":"purple"},
+    {"id":"pl_majerhat",          "name":"Majerhat",             "lat":22.5191900,  "lon":88.3237635,  "line":"purple"},
+
+    # ── ORANGE LINE (Kavi Subhash–Beleghata, Line 6) ─────────────────────────
+    {"id":"ol_kavi_subhash",      "name":"Kavi Subhash",         "lat":22.4722638,  "lon":88.3978346,  "line":"orange"},
+    {"id":"ol_satyajit_ray",      "name":"Satyajit Ray",         "lat":22.4839792,  "lon":88.3922501,  "line":"orange"},
+    {"id":"ol_jyotirindra_nandi", "name":"Jyotirindra Nandi",    "lat":22.4959849,  "lon":88.3985185,  "line":"orange"},
+    {"id":"ol_kavi_sukanta",      "name":"Kavi Sukanta",         "lat":22.5056316,  "lon":88.4010123,  "line":"orange"},
+    {"id":"ol_hemanta",           "name":"Hemanta Mukhopadhyay", "lat":22.5148128,  "lon":88.4016147,  "line":"orange"},
+    {"id":"ol_vip_bazar",         "name":"VIP Bazar",            "lat":22.5249681,  "lon":88.3961903,  "line":"orange"},
+    {"id":"ol_ritwik_ghatak",     "name":"Ritwik Ghatak",        "lat":22.5330417,  "lon":88.3964400,  "line":"orange"},
+    {"id":"ol_barun_sengupta",    "name":"Barun Sengupta",       "lat":22.5440086,  "lon":88.3993215,  "line":"orange"},
+    {"id":"ol_beleghata",         "name":"Beleghata",            "lat":22.5507592,  "lon":88.4040364,  "line":"orange"},
+
+    # ── YELLOW LINE (Noapara–Jai Hind Bimanbandar, Line 5) ───────────────────
+    {"id":"yl_noapara",           "name":"Noapara",              "lat":22.6399953,  "lon":88.3940739,  "line":"yellow"},
+    {"id":"yl_jessore_road",      "name":"Jessore Road",         "lat":22.6392320,  "lon":88.4297938,  "line":"yellow"},
+    {"id":"yl_nagerbazar",        "name":"Nagerbazar",           "lat":22.6481480,  "lon":88.4279020,  "line":"yellow"},
+    {"id":"yl_jai_hind",          "name":"Jai Hind Bimanbandar", "lat":22.6474634,  "lon":88.4373223,  "line":"yellow"},
 ]
 
-# Build index by station id
-_STATION_BY_ID = {s["id"]: s for s in METRO_STATIONS}
+_STATION_BY_ID   = {s["id"]: s for s in METRO_STATIONS}
+_STATION_BY_NAME: dict[str, list[dict]] = {}
+for _s in METRO_STATIONS:
+    _STATION_BY_NAME.setdefault(_s["name"].lower(), []).append(_s)
 
-# Metro line connectivity (ordered station lists for path finding)
-_BLUE_LINE = [s for s in METRO_STATIONS if s["line"] == "blue"]
-_GREEN_LINE = [s for s in METRO_STATIONS if s["line"] == "green"]
+# Per-line ordered lists for path finding
+_LINE_STATIONS: dict[str, list[dict]] = {}
+for _s in METRO_STATIONS:
+    _LINE_STATIONS.setdefault(_s["line"], []).append(_s)
 
 LINE_COLORS = {
-    "blue":  "#2196F3",
-    "green": "#4CAF50",
+    "blue":   "#2196F3",
+    "green":  "#4CAF50",
+    "purple": "#9C27B0",
+    "orange": "#EA4200",
+    "yellow": "#FFCE18",
+}
+
+# Physical interchange points: station name (normalised) → list of (line, station_id)
+# A station can appear on more than two lines — add more tuples to extend.
+_INTERCHANGES: dict[str, list[tuple[str, str]]] = {
+    "esplanade":    [("blue", "bl_esplanade"),  ("green",  "gl_esplanade")],
+    "noapara":      [("blue", "bl_noapara"),     ("yellow", "yl_noapara")],
+    "kavi nazrul":  [("blue", "bl_kavi_nazrul"), ("orange", "ol_kavi_subhash")],
+    # Kavi Subhash on Orange IS the same platform as Kavi Nazrul on Blue
+    "kavi subhash": [("blue", "bl_kavi_nazrul"), ("orange", "ol_kavi_subhash")],
 }
 
 # ── Haversine ─────────────────────────────────────────────────────────────────
@@ -118,87 +139,153 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2
-         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
-         * math.sin(dlon / 2) ** 2)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
 
-def _nearest_station(lat: float, lon: float) -> dict:
-    """Return the metro station nearest to a coordinate."""
-    return min(METRO_STATIONS, key=lambda s: _haversine_km(lat, lon, s["lat"], s["lon"]))
+def _nearest_station(lat: float, lon: float, line: str | None = None) -> dict:
+    pool = [s for s in METRO_STATIONS if line is None or s["line"] == line]
+    return min(pool, key=lambda s: _haversine_km(lat, lon, s["lat"], s["lon"]))
 
 
-def _metro_path(src_station: dict, dst_station: dict) -> list[dict] | None:
+def _on_line(a: dict, b: dict, line_stations: list[dict]) -> list[dict] | None:
+    ids = [s["id"] for s in line_stations]
+    if a["id"] in ids and b["id"] in ids:
+        i, j = ids.index(a["id"]), ids.index(b["id"])
+        return line_stations[i:j+1] if i <= j else list(reversed(line_stations[j:i+1]))
+    return None
+
+
+def _station_on_line(stn: dict, line_name: str) -> dict | None:
+    target = stn["name"].lower()
+    for s in _LINE_STATIONS.get(line_name, []):
+        if s["name"].lower() == target:
+            return s
+    return None
+
+
+# ── Multi-interchange BFS metro path-finder ───────────────────────────────────
+
+def _build_station_graph() -> dict[str, set[str]]:
     """
-    Find the ordered list of stations between src and dst on the same line,
-    including any interchange at Esplanade (Blue/Green junction).
-
-    Returns list of station dicts in travel order, or None if unreachable.
+    Build an adjacency graph where nodes are station IDs.
+    Edges:
+      - consecutive stations on the same line (board → next stop)
+      - interchange edges between stations with the same physical name
+        (e.g. bl_esplanade ↔ gl_esplanade, bl_noapara ↔ yl_noapara)
     """
-    def _on_same_line(a: dict, b: dict, line: list[dict]) -> list[dict] | None:
-        ids = [s["id"] for s in line]
-        if a["id"] in ids and b["id"] in ids:
-            i, j = ids.index(a["id"]), ids.index(b["id"])
-            if i <= j:
-                return line[i:j+1]
-            else:
-                return list(reversed(line[j:i+1]))
+    graph: dict[str, set[str]] = {s["id"]: set() for s in METRO_STATIONS}
+
+    # Same-line adjacency
+    for line_name, stations in _LINE_STATIONS.items():
+        for i in range(len(stations) - 1):
+            a, b = stations[i]["id"], stations[i+1]["id"]
+            graph[a].add(b)
+            graph[b].add(a)
+
+    # Interchange adjacency (same physical station, different line IDs)
+    for ic_variants in _INTERCHANGES.values():
+        for (line_a, id_a) in ic_variants:
+            for (line_b, id_b) in ic_variants:
+                if id_a != id_b and id_a in graph and id_b in graph:
+                    graph[id_a].add(id_b)
+                    graph[id_b].add(id_a)
+
+    # Also link any two stations with identical names on different lines
+    for name_lower, stns in _STATION_BY_NAME.items():
+        if len(stns) > 1:
+            for i in range(len(stns)):
+                for j in range(i+1, len(stns)):
+                    a, b = stns[i]["id"], stns[j]["id"]
+                    if a in graph and b in graph:
+                        graph[a].add(b)
+                        graph[b].add(a)
+
+    return graph
+
+
+# Build once at module load
+_STATION_GRAPH: dict[str, set[str]] = _build_station_graph()
+
+
+def _metro_path_bfs(
+    src: dict,
+    dst: dict,
+    blocked_station_ids: set[str] | None = None,
+) -> list[dict] | None:
+    """
+    BFS over the station graph to find the shortest (fewest stops) path
+    from src to dst, respecting blocked stations (e.g. closed due to
+    disruption events).
+
+    Returns an ordered list of station dicts, or None if no path exists.
+    Each station dict in the result carries the actual object from
+    METRO_STATIONS (with correct id/line/lat/lon).
+    """
+    blocked = blocked_station_ids or set()
+    if src["id"] in blocked or dst["id"] in blocked:
         return None
 
-    # Try direct path on blue or green
-    for line in (_BLUE_LINE, _GREEN_LINE):
-        path = _on_same_line(src_station, dst_station, line)
-        if path:
-            return path
+    queue: deque[list[str]] = deque([[src["id"]]])
+    visited: set[str] = {src["id"]}
 
-    # Try interchange via Esplanade (where blue + green meet)
-    blue_esplanade  = _STATION_BY_ID.get("bl_esplanade")
-    green_esplanade = _STATION_BY_ID.get("gl_esplanade")
-    if not blue_esplanade or not green_esplanade:
-        return None
+    while queue:
+        path_ids = queue.popleft()
+        current_id = path_ids[-1]
 
-    # src → blue Esplanade → green Esplanade → dst
-    seg1 = _on_same_line(src_station, blue_esplanade, _BLUE_LINE)
-    seg2 = _on_same_line(green_esplanade, dst_station, _GREEN_LINE)
-    if seg1 and seg2:
-        return seg1 + seg2
+        if current_id == dst["id"]:
+            return [_STATION_BY_ID[sid] for sid in path_ids]
 
-    # src → green Esplanade → blue Esplanade → dst
-    seg1 = _on_same_line(src_station, green_esplanade, _GREEN_LINE)
-    seg2 = _on_same_line(blue_esplanade, dst_station, _BLUE_LINE)
-    if seg1 and seg2:
-        return seg1 + seg2
+        for neighbour_id in sorted(_STATION_GRAPH.get(current_id, [])):
+            if neighbour_id in visited or neighbour_id in blocked:
+                continue
+            visited.add(neighbour_id)
+            queue.append(path_ids + [neighbour_id])
 
     return None
 
 
-# ── Graph loaders ─────────────────────────────────────────────────────────────
+def _path_cost_km(path: list[dict]) -> float:
+    """Total haversine distance along a station path."""
+    return sum(
+        _haversine_km(path[i]["lat"], path[i]["lon"],
+                      path[i+1]["lat"], path[i+1]["lon"])
+        for i in range(len(path) - 1)
+    )
+
+
+# ── Graph helpers ─────────────────────────────────────────────────────────────
 
 _OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api",
     "https://overpass.kumi.systems/api",
     "https://overpass.openstreetmap.ru/api",
 ]
-
 _GRAPH_PLACES = [
     "Kolkata, West Bengal, India",
+    "Howrah, West Bengal, India",
     "Bidhannagar, West Bengal, India",
     "North Dum Dum, West Bengal, India",
+    "Madhyamgram, West Bengal, India",
     "Barasat I, West Bengal, India",
     "Barasat II, West Bengal, India",
 ]
 
+# In-process graph cache — each pkl is loaded exactly once per server lifetime
+_GRAPH_CACHE: dict[str, object] = {}
+
 
 def _load_or_download_graph(network_type: str, cache_path: str):
+    if cache_path in _GRAPH_CACHE:
+        return _GRAPH_CACHE[cache_path]
     if os.path.exists(cache_path):
-        print(f"  [Route] Loading cached {network_type} graph from {cache_path} ...")
+        print(f"  [Route] Loading cached {network_type} graph ...")
         with open(cache_path, "rb") as f:
             g = pickle.load(f)
         print(f"  [Route] {network_type} graph loaded ({len(g.nodes):,} nodes)")
+        _GRAPH_CACHE[cache_path] = g
         return g
-
-    print(f"  [Route] Downloading OSM {network_type} network (one-time, ~30-60s) ...")
+    print(f"  [Route] Downloading OSM {network_type} network (one-time) ...")
     ox.settings.timeout = 180
     last_err = None
     for ep in _OVERPASS_ENDPOINTS:
@@ -208,331 +295,872 @@ def _load_or_download_graph(network_type: str, cache_path: str):
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             with open(cache_path, "wb") as f:
                 pickle.dump(g, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"  [Route] {network_type} graph cached ({len(g.nodes):,} nodes)")
+            _GRAPH_CACHE[cache_path] = g
             return g
         except Exception as e:
             last_err = e
     raise RuntimeError(f"Failed to download {network_type} graph: {last_err}")
 
 
-# ── Geocoding (reuse from route_engine) ──────────────────────────────────────
-
 def _geocode(place: str) -> tuple[float, float]:
+    p = (place or "").strip()
+    p = p.replace('\u202f', ' ').replace('\xa0', ' ')
+    p_clean = re.sub(r'\s+', ' ', re.sub(r'[()]', ' ', p)).strip()
+
+    for s in METRO_STATIONS:
+        s_name_clean = re.sub(r'\s+', ' ', re.sub(r'[()]', ' ', s["name"]).replace('\u202f', ' ').replace('\xa0', ' ')).strip()
+        if s_name_clean.lower() == p_clean.lower() or s["id"].lower() == p_clean.lower():
+            return (s["lat"], s["lon"])
+
+    for s in METRO_STATIONS:
+        s_name_clean = re.sub(r'\s+', ' ', re.sub(r'[()]', ' ', s["name"]).replace('\u202f', ' ').replace('\xa0', ' ')).strip()
+        if p_clean.lower() in s_name_clean.lower() or s_name_clean.lower() in p_clean.lower():
+            return (s["lat"], s["lon"])
+
     from routing.route_engine import _geocode_with_context
     return _geocode_with_context(place)
 
 
-# ── GeoJSON builder ───────────────────────────────────────────────────────────
+# ── GeoJSON helpers ───────────────────────────────────────────────────────────
 
-def _nodes_to_geojson(graph, node_list: list, label: str, distance_km: float, travel_time_min: float) -> dict:
-    coords = [
-        [graph.nodes[n]["x"], graph.nodes[n]["y"]]
-        for n in node_list
-        if "x" in graph.nodes[n] and "y" in graph.nodes[n]
-    ]
-    return {
-        "type": "FeatureCollection",
-        "features": [{
-            "type": "Feature",
-            "geometry": {"type": "LineString", "coordinates": coords},
-            "properties": {"label": label, "distance_km": distance_km, "travel_time_min": travel_time_min},
-        }]
-    }
+def _nodes_to_geojson(graph, nodes, label, dist_km, time_min):
+    coords = [[graph.nodes[n]["x"], graph.nodes[n]["y"]] for n in nodes if "x" in graph.nodes[n]]
+    return {"type": "FeatureCollection", "features": [{"type": "Feature",
+        "geometry": {"type": "LineString", "coordinates": coords},
+        "properties": {"label": label, "distance_km": dist_km, "travel_time_min": time_min}}]}
 
 
-def _straight_geojson(points: list[tuple[float, float]], label: str, distance_km: float, travel_time_min: float) -> dict:
-    """GeoJSON from a list of (lat, lon) tuples."""
+def _straight_geojson(points, label, dist_km, time_min):
     coords = [[lon, lat] for lat, lon in points]
-    return {
-        "type": "FeatureCollection",
-        "features": [{
+    return {"type": "FeatureCollection", "features": [{"type": "Feature",
+        "geometry": {"type": "LineString", "coordinates": coords},
+        "properties": {"label": label, "distance_km": dist_km, "travel_time_min": time_min}}]}
+
+
+def _multi_segment_geojson(
+    feeder1_coords: list[list[float]],   # [[lon, lat], ...]
+    metro_segments: list[tuple[str, list[list[float]]]],  # [(line_color, [[lon, lat],...]), ...]
+    feeder2_coords: list[list[float]],
+    label: str,
+    dist_km: float,
+    time_min: int,
+) -> dict:
+    """
+    Build a GeoJSON FeatureCollection with separate coloured features for
+    each leg of a multimodal journey.
+
+    feeder1 and feeder2 are rendered in grey (#607D8B).
+    Each metro segment gets its line colour.
+    """
+    features = []
+
+    if feeder1_coords:
+        features.append({
             "type": "Feature",
-            "geometry": {"type": "LineString", "coordinates": coords},
-            "properties": {"label": label, "distance_km": distance_km, "travel_time_min": travel_time_min},
-        }]
-    }
+            "geometry": {"type": "LineString", "coordinates": feeder1_coords},
+            "properties": {"segment": "feeder_start", "color": "#607D8B",
+                           "label": "Walk/Bike/Drive to metro"},
+        })
 
+    for seg_color, seg_coords in metro_segments:
+        if seg_coords:
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": seg_coords},
+                "properties": {"segment": "metro", "color": seg_color,
+                               "label": label},
+            })
 
-# ── Road-network routing (drive / walk / bike) ────────────────────────────────
-
-def _road_routes(source: str, destination: str, network_type: str, speed_kmh: float) -> dict:
-    """
-    Compute multiple distinct routes on a road network graph.
-    Returns the same shape as route_engine.get_multiple_routes().
-    """
-    from routing.route_engine import extract_road_names, _routes_are_distinct
-
-    if network_type == "drive":
-        cache_path = GRAPH_CACHE_PATH
-    elif network_type == "walk":
-        cache_path = _GRAPH_WALK
-    else:
-        cache_path = _GRAPH_BIKE
-
-    graph = _load_or_download_graph(network_type, cache_path)
-
-    src_coords  = _geocode(source)
-    dst_coords  = _geocode(destination)
-
-    src_node  = ox.distance.nearest_nodes(graph, X=src_coords[1],  Y=src_coords[0])
-    dest_node = ox.distance.nearest_nodes(graph, X=dst_coords[1],  Y=dst_coords[0])
-
-    PENALTY       = 5.0
-    max_routes    = MAX_ROUTES
-    max_attempts  = max_routes * 6
-
-    G = graph.copy()
-    routes_raw: list     = []
-    seen_sets:  list     = []
-    dupes = 0
-
-    for _ in range(max_attempts):
-        if len(routes_raw) >= max_routes: break
-        if dupes >= MAX_CONSECUTIVE_DUPES: break
-
-        route = ox.shortest_path(G, src_node, dest_node, weight="length")
-        if route is None: break
-
-        edge_set = frozenset(zip(route[:-1], route[1:]))
-        is_new = all(_routes_are_distinct(edge_set, prev, MIN_ROUTE_DIVERGENCE) for prev in seen_sets)
-
-        for u, v in zip(route[:-1], route[1:]):
-            for k in G[u][v]:
-                G[u][v][k]["length"] *= PENALTY
-
-        if not is_new:
-            dupes += 1; continue
-
-        routes_raw.append(route)
-        seen_sets.append(edge_set)
-        dupes = 0
-
-    if not routes_raw:
-        raise ValueError(f"No {network_type} route found between '{source}' and '{destination}'.")
-
-    routes_out = []
-    for idx, node_list in enumerate(routes_raw):
-        roads = extract_road_names(graph, node_list)
-        total_m = sum(
-            graph.get_edge_data(u, v, 0).get("length", 0)
-            for u, v in zip(node_list[:-1], node_list[1:])
-        )
-        dist_km   = round(total_m / 1000, 2)
-        time_min  = round((dist_km / speed_kmh) * 60)
-        coords    = [(graph.nodes[n]["y"], graph.nodes[n]["x"]) for n in node_list if "y" in graph.nodes[n]]
-        geojson   = _nodes_to_geojson(graph, node_list, f"Route {idx+1}", dist_km, time_min)
-
-        routes_out.append({
-            "id":              idx,
-            "label":           f"Route {idx+1}",
-            "road_names":      roads,
-            "distance_km":     dist_km,
-            "travel_time_min": time_min,
-            "geojson":         geojson,
-            "node_ids":        node_list,
-            "coords":          coords,
-            "mode":            network_type,
+    if feeder2_coords:
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": feeder2_coords},
+            "properties": {"segment": "feeder_end", "color": "#607D8B",
+                           "label": "Walk/Bike/Drive from metro"},
         })
 
     return {
-        "source":      source,
-        "destination": destination,
-        "src_coords":  list(src_coords),
-        "dst_coords":  list(dst_coords),
-        "routes":      routes_out,
-        "mode":        network_type,
+        "type": "FeatureCollection",
+        "features": features,
+        "_meta": {"label": label, "distance_km": dist_km, "travel_time_min": time_min},
     }
 
 
-# ── Metro routing ─────────────────────────────────────────────────────────────
+# ── Road routing ──────────────────────────────────────────────────────────────
 
-def _metro_route(source: str, destination: str) -> dict:
+def _road_routes(source: str, destination: str, network_type: str, speed_kmh: float) -> dict:
+    from routing.route_engine import extract_road_names, _routes_are_distinct
+    cache = {"drive": GRAPH_CACHE_PATH, "walk": _GRAPH_WALK, "bike": _GRAPH_BIKE}[network_type]
+
+    graph = _load_or_download_graph(network_type, cache)
+    sc = _geocode(source)
+    dc = _geocode(destination)
+    sn = ox.distance.nearest_nodes(graph, X=sc[1], Y=sc[0])
+    dn = ox.distance.nearest_nodes(graph, X=dc[1], Y=dc[0])
+
+    G = graph.copy(); raw = []; seen = []; dupes = 0
+    for _ in range(MAX_ROUTES * 6):
+        if len(raw) >= MAX_ROUTES or dupes >= MAX_CONSECUTIVE_DUPES:
+            break
+        r = ox.shortest_path(G, sn, dn, weight="length")
+        if r is None:
+            break
+        es = frozenset(zip(r[:-1], r[1:]))
+        new = all(_routes_are_distinct(es, p, MIN_ROUTE_DIVERGENCE) for p in seen)
+        for u, v in zip(r[:-1], r[1:]):
+            for k in G[u][v]:
+                G[u][v][k]["length"] *= 5.0
+        if not new:
+            dupes += 1
+            continue
+        raw.append(r); seen.append(es); dupes = 0
+
+    if not raw:
+        raise ValueError(f"No {network_type} route found between '{source}' and '{destination}'.")
+
+    out = []
+    for idx, nl in enumerate(raw):
+        roads = extract_road_names(graph, nl)
+        dm = sum(graph.get_edge_data(u, v, 0).get("length", 0) for u, v in zip(nl[:-1], nl[1:]))
+        dk = round(dm / 1000, 2)
+        tm = round((dk / speed_kmh) * 60)
+        coords = [(graph.nodes[n]["y"], graph.nodes[n]["x"]) for n in nl if "y" in graph.nodes[n]]
+        out.append({
+            "id": idx, "label": f"Route {idx+1}",
+            "road_names": roads, "distance_km": dk, "travel_time_min": tm,
+            "geojson": _nodes_to_geojson(graph, nl, f"Route {idx+1}", dk, tm),
+            "node_ids": nl, "coords": coords, "mode": network_type,
+        })
+
+    return {"source": source, "destination": destination, "src_coords": list(sc),
+            "dst_coords": list(dc), "routes": out, "mode": network_type}
+
+
+def _road_route_single_best(
+    source: str,
+    destination: str,
+    network_type: str,
+    speed_kmh: float,
+) -> dict | None:
     """
-    Build a metro route:
-      Walk (source → nearest metro station)
-      → Metro (station sequence along the line)
-      → Walk (nearest metro station → destination)
-
-    Returns one "route" in the same shape as _road_routes(), but with
-    additional metro-specific fields:
-      segments: list of {type, from, to, distance_km, time_min, stations, geojson}
-      metro_stations_used: list of station names
+    Best single OSM road route. Returns dict with road_names, distance_km,
+    travel_time_min, coords (lat/lon), geojson_coords (lon/lat).
+    Returns None on failure or if distance < 50 m.
     """
-    src_coords = _geocode(source)
-    dst_coords = _geocode(destination)
+    try:
+        from routing.route_engine import extract_road_names
+        cache = {"drive": GRAPH_CACHE_PATH, "walk": _GRAPH_WALK, "bike": _GRAPH_BIKE}[network_type]
+        graph = _load_or_download_graph(network_type, cache)
+        sc = _geocode(source)
+        dc = _geocode(destination)
+        if _haversine_km(sc[0], sc[1], dc[0], dc[1]) < 0.05:
+            return None
+        sn = ox.distance.nearest_nodes(graph, X=sc[1], Y=sc[0])
+        dn = ox.distance.nearest_nodes(graph, X=dc[1], Y=dc[0])
+        r = ox.shortest_path(graph, sn, dn, weight="length")
+        if r is None:
+            return None
+        roads = extract_road_names(graph, r)
+        dm = sum(graph.get_edge_data(u, v, 0).get("length", 0) for u, v in zip(r[:-1], r[1:]))
+        dk = round(dm / 1000, 2)
+        tm = round((dk / speed_kmh) * 60)
+        coords = [(graph.nodes[n]["y"], graph.nodes[n]["x"]) for n in r if "y" in graph.nodes[n]]
+        geojson_coords = [[graph.nodes[n]["x"], graph.nodes[n]["y"]] for n in r if "x" in graph.nodes[n]]
+        return {"road_names": roads, "distance_km": dk, "travel_time_min": tm,
+                "coords": coords, "geojson_coords": geojson_coords}
+    except Exception as e:
+        print(f"  [Route] Feeder leg failed ({source} → {destination}): {e}")
+        return None
 
-    src_lat, src_lon = src_coords
-    dst_lat, dst_lon = dst_coords
 
-    # Nearest stations to source and destination
-    src_station = _nearest_station(src_lat, src_lon)
-    dst_station = _nearest_station(dst_lat, dst_lon)
+# ── Disruption context helpers ────────────────────────────────────────────────
 
-    # Walk distances
-    walk_src_km = _haversine_km(src_lat, src_lon, src_station["lat"], src_station["lon"])
-    walk_dst_km = _haversine_km(dst_lat, dst_lon, dst_station["lat"], dst_station["lon"])
+def _extract_blocked_stations(events: list[dict]) -> set[str]:
+    """
+    Given a list of extracted disruption events, return the set of station IDs
+    that should be considered blocked/degraded.
+
+    Criteria (conservative — only block when high confidence of closure):
+      - event_type contains 'closure' or 'suspension'
+      - AND severity is 'high'
+      - AND location matches a known metro station name
+    """
+    blocked: set[str] = set()
+    if not events:
+        return blocked
+
+    closure_types = {"closure", "suspension", "disruption", "shutdown"}
+
+    for ev in events:
+        et = (ev.get("event_type") or "").lower()
+        sev = (ev.get("severity") or "").lower()
+        loc = (ev.get("location") or "").lower()
+        road = (ev.get("road_name") or "").lower()
+
+        is_closure = any(ct in et for ct in closure_types)
+        is_severe  = sev in ("high", "critical")
+
+        if not (is_closure and is_severe):
+            continue
+
+        # Match location/road against station names
+        for stn in METRO_STATIONS:
+            stn_name = stn["name"].lower()
+            if stn_name in loc or stn_name in road:
+                blocked.add(stn["id"])
+                print(f"  [Metro] Blocking station '{stn['name']}' due to disruption: {ev.get('reason','')[:60]}")
+
+    return blocked
+
+
+def _score_metro_path(
+    path: list[dict],
+    walk_src_km: float,
+    walk_dst_km: float,
+    events: list[dict],
+) -> float:
+    """
+    Composite score for ranking alternative metro paths.
+    Lower is better.
+
+    Components:
+      - Total journey distance (km)
+      - Number of interchanges × 5-minute penalty
+      - Disruption score from events near stations on the path
+    """
+    metro_km = _path_cost_km(path)
+    total_km = walk_src_km + metro_km + walk_dst_km
+
+    # Count line changes
+    num_changes = sum(
+        1 for i in range(1, len(path))
+        if path[i]["line"] != path[i-1]["line"]
+    )
+    change_penalty = num_changes * (5.0 / 60.0)  # in hour-equivalent distance units
+
+    # Disruption penalty: count high-severity events near each station
+    disruption_penalty = 0.0
+    if events:
+        station_names = {s["name"].lower() for s in path}
+        for ev in events:
+            loc = (ev.get("location") or "").lower()
+            road = (ev.get("road_name") or "").lower()
+            sev = ev.get("severity", "low")
+            weight = {"high": 2.0, "medium": 1.0, "low": 0.3}.get(sev, 0.3)
+            if any(sn in loc or sn in road for sn in station_names):
+                disruption_penalty += weight
+
+    return total_km + change_penalty + disruption_penalty
+
+
+# ── Metro line-segment splitting ──────────────────────────────────────────────
+
+def _direction_on_line(board: dict, alight: dict, line_name: str) -> str:
+    stations = _LINE_STATIONS.get(line_name, [])
+    names = [s["name"].lower() for s in stations]
+    bi = next((i for i, s in enumerate(names) if s == board["name"].lower()), None)
+    ai = next((i for i, s in enumerate(names) if s == alight["name"].lower()), None)
+    if bi is None or ai is None:
+        return "a_to_b"
+    return "a_to_b" if ai >= bi else "b_to_a"
+
+
+def _split_path_by_line(path: list[dict]) -> list[tuple[str, list[dict]]]:
+    """
+    Split a multi-line BFS path into (line_name, [stations]) segments.
+    Interchange transfer steps (same-name, different-ID nodes) are collapsed
+    so each segment has a clean board→alight sequence on one line.
+    """
+    if not path:
+        return []
+
+    segments: list[tuple[str, list[dict]]] = []
+    current_line  = path[0]["line"]
+    current_group = [path[0]]
+
+    for stn in path[1:]:
+        if stn["line"] == current_line:
+            current_group.append(stn)
+        else:
+            # Check if this is a transfer node (same name as last in current_group)
+            if stn["name"].lower() == current_group[-1]["name"].lower():
+                # This is a same-platform interchange transfer step — just switch line
+                segments.append((current_line, current_group))
+                current_line  = stn["line"]
+                current_group = [stn]
+            else:
+                # Find the canonical interchange station on the new line
+                ic_on_new = _station_on_line(current_group[-1], stn["line"])
+                segments.append((current_line, current_group))
+                current_line  = stn["line"]
+                current_group = [ic_on_new] if ic_on_new else []
+                if stn.get("id") != (ic_on_new or {}).get("id"):
+                    current_group.append(stn)
+
+    if current_group:
+        segments.append((current_line, current_group))
+
+    # Remove zero-stop segments (transfer-only nodes)
+    return [(ln, stns) for ln, stns in segments if len(stns) >= 1]
+
+
+# ── Metro route builder ───────────────────────────────────────────────────────
+
+def _build_metro_route_for_pair(
+    source: str,
+    destination: str,
+    sc: tuple[float, float],
+    dc: tuple[float, float],
+    src_stn: dict,
+    dst_stn: dict,
+    path: list[dict],
+    walk_src_km: float,
+    walk_dst_km: float,
+    route_id: int,
+    label: str,
+) -> dict:
+    """
+    Build a complete metro route dict given a source→dest station pair and path.
+    This is the pure metro version (feeder legs are simple walk estimates).
+    """
+    from routing.metro_timetable import next_train_for_journey, IST
+
+    now = datetime.now(tz=IST)
+    line_segments = _split_path_by_line(path)
+    interchange   = len(line_segments) > 1
 
     walk_src_min = round((walk_src_km / 5.0) * 60)
     walk_dst_min = round((walk_dst_km / 5.0) * 60)
 
-    # Metro path between stations
-    metro_path = _metro_path(src_station, dst_station)
-
-    if metro_path is None or len(metro_path) < 2:
-        # No metro path — fall back to straight walk
-        total_km  = _haversine_km(src_lat, src_lon, dst_lat, dst_lon)
-        total_min = round((total_km / 5.0) * 60)
-        geojson   = _straight_geojson([(src_lat, src_lon), (dst_lat, dst_lon)], "Walk (no metro)", total_km, total_min)
-        return {
-            "source": source, "destination": destination,
-            "src_coords": list(src_coords), "dst_coords": list(dst_coords),
-            "mode": "metro",
-            "routes": [{
-                "id": 0, "label": "Walk (no metro connection)",
-                "road_names": [], "distance_km": round(total_km, 2),
-                "travel_time_min": total_min, "geojson": geojson,
-                "coords": [(src_lat, src_lon), (dst_lat, dst_lon)],
-                "mode": "metro",
-                "segments": [],
-                "metro_note": "No metro connection between these points. Showing walk route.",
-            }],
-        }
-
-    # Compute metro distance along station sequence
-    metro_km = sum(
-        _haversine_km(metro_path[i]["lat"], metro_path[i]["lon"],
-                      metro_path[i+1]["lat"], metro_path[i+1]["lon"])
-        for i in range(len(metro_path) - 1)
-    )
-    metro_min = round((metro_km / 35.0) * 60) + 3  # +3 min boarding/alighting
-
+    metro_km  = _path_cost_km(path)
+    metro_min = round((metro_km / 35.0) * 60) + 3 * len(line_segments)
     total_km  = round(walk_src_km + metro_km + walk_dst_km, 2)
     total_min = walk_src_min + metro_min + walk_dst_min
 
-    # Build segments for frontend display
-    segments = [
-        {
-            "type":        "walk",
-            "from":        source,
-            "to":          src_station["name"],
-            "distance_km": round(walk_src_km, 2),
-            "time_min":    walk_src_min,
-            "line":        None,
-        },
-        {
-            "type":        "metro",
-            "from":        src_station["name"],
-            "to":          dst_station["name"],
-            "distance_km": round(metro_km, 2),
-            "time_min":    metro_min,
-            "line":        metro_path[0].get("line", "blue"),
-            "stations":    [s["name"] for s in metro_path],
-            "num_stops":   len(metro_path) - 1,
-        },
-        {
-            "type":        "walk",
-            "from":        dst_station["name"],
-            "to":          destination,
-            "distance_km": round(walk_dst_km, 2),
-            "time_min":    walk_dst_min,
-            "line":        None,
-        },
-    ]
+    segments = []
+    segments.append({
+        "type": "walk", "from": source, "to": src_stn["name"],
+        "distance_km": round(walk_src_km, 2), "time_min": walk_src_min, "line": None,
+    })
 
-    # Build a composite GeoJSON combining all segments
-    all_points = (
-        [(src_lat, src_lon), (src_station["lat"], src_station["lon"])]
-        + [(s["lat"], s["lon"]) for s in metro_path]
-        + [(dst_station["lat"], dst_station["lon"]), (dst_lat, dst_lon)]
+    for seg_line, seg_stns in line_segments:
+        if not seg_stns:
+            continue
+        board  = seg_stns[0]
+        alight = seg_stns[-1]
+        seg_km = round(_path_cost_km(seg_stns), 2)
+        seg_min = round((seg_km / 35.0) * 60) + 3
+        direction = _direction_on_line(board, alight, seg_line)
+        next_train = next_train_for_journey(
+            src_station=board["name"], dst_station=alight["name"],
+            direction=direction, line_name=seg_line, now=now,
+        )
+        segments.append({
+            "type": "metro", "from": board["name"], "to": alight["name"],
+            "distance_km": seg_km, "time_min": seg_min, "line": seg_line,
+            "stations": [s["name"] for s in seg_stns],
+            "num_stops": len(seg_stns) - 1,
+            "next_train": next_train,
+        })
+
+    segments.append({
+        "type": "walk", "from": dst_stn["name"], "to": destination,
+        "distance_km": round(walk_dst_km, 2), "time_min": walk_dst_min, "line": None,
+    })
+
+    first_metro = next((s for s in segments if s["type"] == "metro"), None)
+    next_train_top = first_metro["next_train"] if first_metro else None
+
+    interchange_note = ""
+    if interchange:
+        ic_names = []
+        for (_, seg_stns), (_, next_stns) in zip(line_segments[:-1], line_segments[1:]):
+            ic_names.append(seg_stns[-1]["name"])
+        interchange_note = "Change at " + ", ".join(ic_names)
+
+    all_pts = (
+        [(sc[0], sc[1]), (src_stn["lat"], src_stn["lon"])]
+        + [(s["lat"], s["lon"]) for s in path]
+        + [(dst_stn["lat"], dst_stn["lon"]), (dc[0], dc[1])]
     )
-    geojson = _straight_geojson(all_points, "Metro Route", total_km, total_min)
-
-    # Coords for spatial corridor matching
-    coords = all_points
-
-    # Road names = station names (for display in panel)
-    road_names = [s["name"] for s in metro_path]
+    geo = _straight_geojson(all_pts, label, total_km, total_min)
 
     return {
-        "source":      source,
-        "destination": destination,
-        "src_coords":  list(src_coords),
-        "dst_coords":  list(dst_coords),
-        "mode":        "metro",
-        "routes": [{
-            "id":              0,
-            "label":           "Metro Route",
-            "road_names":      road_names,
-            "distance_km":     total_km,
-            "travel_time_min": total_min,
-            "geojson":         geojson,
-            "node_ids":        [],
-            "coords":          coords,
-            "mode":            "metro",
-            "segments":        segments,
-            "metro_stations":  [s["name"] for s in metro_path],
-            "walk_src_min":    walk_src_min,
-            "walk_dst_min":    walk_dst_min,
-            "metro_min":       metro_min,
-            "interchange":     any(metro_path[i]["line"] != metro_path[i-1]["line"] for i in range(1, len(metro_path))),
-        }],
+        "id": route_id, "label": label,
+        "road_names": [s["name"] for s in path],
+        "distance_km": total_km, "travel_time_min": total_min,
+        "geojson": geo, "node_ids": [], "coords": list(all_pts),
+        "mode": "metro", "segments": segments,
+        "metro_stations": [s["name"] for s in path],
+        "walk_src_min": walk_src_min, "walk_dst_min": walk_dst_min,
+        "metro_min": metro_min, "interchange": interchange,
+        "interchange_note": interchange_note,
+        "next_train": next_train_top,
+        "num_interchanges": len(line_segments) - 1,
+    }
+
+
+def _metro_route(source: str, destination: str, events: list[dict] | None = None) -> dict:
+    """
+    Find up to MAX_ROUTES distinct metro routes between source and destination.
+
+    Uses BFS over the full station graph to handle any number of interchanges.
+    Disruption events are used to:
+      1. Block stations reported as closed/suspended (high severity)
+      2. Score alternative paths (paths avoiding disrupted stations rank higher)
+    """
+    sc = _geocode(source)
+    dc = _geocode(destination)
+    ev = events or []
+
+    # Identify blocked stations from disruption context
+    blocked = _extract_blocked_stations(ev)
+
+    # Build candidate boarding/alighting stations
+    # Use nearest 3 per line as candidates to generate route diversity
+    all_lines = list(_LINE_STATIONS.keys())
+
+    def _top_n_on_line(lat: float, lon: float, line: str, n: int = 3) -> list[dict]:
+        stns = sorted(_LINE_STATIONS[line],
+                      key=lambda s: _haversine_km(lat, lon, s["lat"], s["lon"]))
+        return [s for s in stns[:n] if s["id"] not in blocked]
+
+    src_candidates: list[dict] = []
+    dst_candidates: list[dict] = []
+    for ln in all_lines:
+        src_candidates.extend(_top_n_on_line(sc[0], sc[1], ln, 2))
+        dst_candidates.extend(_top_n_on_line(dc[0], dc[1], ln, 2))
+
+    # Deduplicate preserving order
+    def _uniq_by_id(lst: list[dict]) -> list[dict]:
+        seen: set[str] = set(); out = []
+        for x in lst:
+            if x["id"] not in seen:
+                seen.add(x["id"]); out.append(x)
+        return out
+
+    src_candidates = _uniq_by_id(src_candidates)
+    dst_candidates = _uniq_by_id(dst_candidates)
+
+    # Try all src×dst combos, find BFS paths, score and rank them
+    scored: list[tuple[float, dict, dict, list[dict], float, float]] = []
+    seen_path_sigs: set[tuple[str, ...]] = set()
+
+    for s in src_candidates:
+        if s["id"] in blocked:
+            continue
+        for d in dst_candidates:
+            if d["id"] in blocked or s["id"] == d["id"]:
+                continue
+            path = _metro_path_bfs(s, d, blocked_station_ids=blocked)
+            if not path or len(path) < 2:
+                continue
+            sig = tuple(st["id"] for st in path)
+            if sig in seen_path_sigs:
+                continue
+            seen_path_sigs.add(sig)
+            wk_src = _haversine_km(sc[0], sc[1], s["lat"], s["lon"])
+            wk_dst = _haversine_km(dc[0], dc[1], d["lat"], d["lon"])
+            score  = _score_metro_path(path, wk_src, wk_dst, ev)
+            scored.append((score, s, d, path, wk_src, wk_dst))
+
+    if not scored:
+        # No metro connection — fallback walk route
+        total_km  = round(_haversine_km(sc[0], sc[1], dc[0], dc[1]), 2)
+        total_min = round((total_km / 5.0) * 60)
+        geo = _straight_geojson([(sc[0], sc[1]), (dc[0], dc[1])], "Walk", total_km, total_min)
+        return {
+            "source": source, "destination": destination,
+            "src_coords": list(sc), "dst_coords": list(dc),
+            "mode": "metro",
+            "routes": [{
+                "id": 0, "label": "Walk (no metro)", "road_names": [],
+                "distance_km": total_km, "travel_time_min": total_min,
+                "geojson": geo, "coords": [(sc[0], sc[1]), (dc[0], dc[1])],
+                "mode": "metro", "segments": [],
+                "metro_note": "No metro connection found. Showing walk route.",
+            }],
+        }
+
+    # Sort by score, take top MAX_ROUTES
+    scored.sort(key=lambda x: x[0])
+    top = scored[:MAX_ROUTES]
+
+    routes_out = []
+    for rank, (score, src_stn, dst_stn, path, wk_src, wk_dst) in enumerate(top):
+        n_ic = sum(1 for i in range(1, len(path)) if path[i]["line"] != path[i-1]["line"])
+        if rank == 0:
+            lbl = "Best Metro Route"
+        elif n_ic == 0:
+            lbl = f"Direct · {path[0]['line'].title()} Line"
+        else:
+            lbl = f"Via {n_ic} interchange{'s' if n_ic > 1 else ''}"
+        r = _build_metro_route_for_pair(
+            source, destination, sc, dc,
+            src_stn, dst_stn, path, wk_src, wk_dst,
+            route_id=rank, label=lbl,
+        )
+        routes_out.append(r)
+
+    return {
+        "source": source, "destination": destination,
+        "src_coords": list(sc), "dst_coords": list(dc),
+        "mode": "metro", "routes": routes_out,
+    }
+
+
+# ── Multimodal combo route ────────────────────────────────────────────────────
+
+def _build_combo_route(
+    source: str,
+    destination: str,
+    sc: tuple[float, float],
+    dc: tuple[float, float],
+    src_stn: dict,
+    dst_stn: dict,
+    path: list[dict],
+    wk_src_km: float,
+    wk_dst_km: float,
+    feeder_mode: str,
+    speed_kmh: float,
+    route_id: int,
+    label: str,
+    events: list[dict],
+) -> dict:
+    """
+    Build one multimodal route from a given boarding/alighting station pair.
+    Feeder legs are OSM-routed; metro leg is station-list + timetable.
+    """
+    from routing.metro_timetable import next_train_for_journey, IST
+
+    now = datetime.now(tz=IST)
+    combo_mode = f"metro+{feeder_mode}"
+    line_segments = _split_path_by_line(path)
+    interchange   = len(line_segments) > 1
+
+    # ── OSM-route both feeder legs ────────────────────────────────────────────
+    leg1 = _road_route_single_best(source,       src_stn["name"], feeder_mode, speed_kmh)
+    leg2 = _road_route_single_best(dst_stn["name"], destination,  feeder_mode, speed_kmh)
+
+    # Feeder leg 1
+    if leg1:
+        leg1_dk, leg1_tm = leg1["distance_km"], leg1["travel_time_min"]
+        leg1_roads = leg1["road_names"]
+        leg1_geo   = leg1["geojson_coords"]
+        leg1_coords = leg1["coords"]
+    else:
+        leg1_dk = round(wk_src_km, 2)
+        leg1_tm = round((leg1_dk / speed_kmh) * 60)
+        leg1_roads = []
+        leg1_geo   = [[sc[1], sc[0]], [src_stn["lon"], src_stn["lat"]]]
+        leg1_coords = [(sc[0], sc[1]), (src_stn["lat"], src_stn["lon"])]
+
+    # Feeder leg 2
+    if leg2:
+        leg2_dk, leg2_tm = leg2["distance_km"], leg2["travel_time_min"]
+        leg2_roads = leg2["road_names"]
+        leg2_geo   = leg2["geojson_coords"]
+        leg2_coords = leg2["coords"]
+    else:
+        leg2_dk = round(wk_dst_km, 2)
+        leg2_tm = round((leg2_dk / speed_kmh) * 60)
+        leg2_roads = []
+        leg2_geo   = [[dst_stn["lon"], dst_stn["lat"]], [dc[1], dc[0]]]
+        leg2_coords = [(dst_stn["lat"], dst_stn["lon"]), (dc[0], dc[1])]
+
+    # ── Build metro segments ──────────────────────────────────────────────────
+    metro_min_total = 0
+    metro_km_total  = 0.0
+    metro_geojson_segs: list[tuple[str, list[list[float]]]] = []
+    journey_segs: list[dict] = []
+
+    journey_segs.append({
+        "type": feeder_mode, "mode": feeder_mode,
+        "from": source, "to": src_stn["name"],
+        "distance_km": leg1_dk, "time_min": leg1_tm, "line": None,
+    })
+
+    for seg_line, seg_stns in line_segments:
+        if not seg_stns:
+            continue
+        board  = seg_stns[0]
+        alight = seg_stns[-1]
+        seg_km = round(_path_cost_km(seg_stns), 2)
+        seg_min = round((seg_km / 35.0) * 60) + 3
+        metro_km_total  += seg_km
+        metro_min_total += seg_min
+
+        direction = _direction_on_line(board, alight, seg_line)
+        next_train = next_train_for_journey(
+            src_station=board["name"], dst_station=alight["name"],
+            direction=direction, line_name=seg_line, now=now,
+        )
+        journey_segs.append({
+            "type": "metro", "from": board["name"], "to": alight["name"],
+            "distance_km": seg_km, "time_min": seg_min, "line": seg_line,
+            "stations": [s["name"] for s in seg_stns],
+            "num_stops": len(seg_stns) - 1,
+            "next_train": next_train,
+        })
+
+        seg_color = LINE_COLORS.get(seg_line, "#7c4dff")
+        seg_geo_pts = [[s["lon"], s["lat"]] for s in seg_stns]
+        metro_geojson_segs.append((seg_color, seg_geo_pts))
+
+    journey_segs.append({
+        "type": feeder_mode, "mode": feeder_mode,
+        "from": dst_stn["name"], "to": destination,
+        "distance_km": leg2_dk, "time_min": leg2_tm, "line": None,
+    })
+
+    total_km  = round(leg1_dk + metro_km_total + leg2_dk, 2)
+    total_min = leg1_tm + metro_min_total + leg2_tm
+
+    # ── Stitch GeoJSON with per-segment colours ───────────────────────────────
+    # De-duplicate boundary points between segments
+    def _join(a: list, b: list) -> list:
+        if not a:
+            return b
+        if not b:
+            return a
+        if abs(a[-1][0] - b[0][0]) < 1e-7 and abs(a[-1][1] - b[0][1]) < 1e-7:
+            return a + b[1:]
+        return a + b
+
+    # Build flat coord list for legacy `coords` (lat/lon) field
+    all_coords: list[tuple[float, float]] = list(leg1_coords)
+    for _, seg_pts in metro_geojson_segs:
+        for pt in seg_pts:
+            all_coords.append((pt[1], pt[0]))
+    all_coords.extend(leg2_coords)
+
+    geo = _multi_segment_geojson(
+        feeder1_coords=leg1_geo,
+        metro_segments=metro_geojson_segs,
+        feeder2_coords=leg2_geo,
+        label=label,
+        dist_km=total_km,
+        time_min=total_min,
+    )
+
+    # ── Disruption context: flag this route if events affect it ──────────────
+    station_names_on_path = {s["name"].lower() for s in path}
+    all_road_names = list(set(leg1_roads + [s["name"] for s in path] + leg2_roads))
+    disruption_flags: list[str] = []
+    for ev in events:
+        loc = (ev.get("location") or "").lower()
+        sev = ev.get("severity", "low")
+        if any(sn in loc for sn in station_names_on_path) and sev in ("high", "medium"):
+            disruption_flags.append(f"{ev.get('event_type','event')} at {ev.get('location','?')}")
+
+    first_metro_seg = next((s for s in journey_segs if s["type"] == "metro"), None)
+    next_train_top  = first_metro_seg["next_train"] if first_metro_seg else None
+
+    interchange_note = ""
+    if interchange:
+        ic_names = [seg_stns[-1]["name"] for _, seg_stns in line_segments[:-1] if seg_stns]
+        interchange_note = "Change at " + ", ".join(ic_names)
+
+    return {
+        "id": route_id, "label": label,
+        "road_names": all_road_names,
+        "distance_km": total_km, "travel_time_min": total_min,
+        "geojson": geo, "node_ids": [], "coords": all_coords,
+        "mode": combo_mode, "segments": journey_segs,
+        "metro_stations": [s["name"] for s in path],
+        "walk_src_min": leg1_tm, "walk_dst_min": leg2_tm,
+        "metro_min": metro_min_total,
+        "interchange": interchange, "interchange_note": interchange_note,
+        "next_train": next_train_top,
+        "num_interchanges": len(line_segments) - 1,
+        "disruption_flags": disruption_flags,
+    }
+
+
+def _metro_combo_route(
+    source: str,
+    destination: str,
+    feeder_mode: str,
+    events: list[dict] | None = None,
+) -> dict:
+    """
+    Generate multiple multimodal (metro + feeder) route alternatives.
+
+    Algorithm:
+      1. Identify blocked stations from disruption events.
+      2. For each of the top-N candidate boarding stations near source and
+         top-N alighting stations near destination, run BFS to find a metro
+         path. Score each combination.
+      3. Pick the top MAX_ROUTES distinct combinations.
+      4. For each selected combination, OSM-route the feeder legs.
+      5. Return all routes ranked by composite score (time + disruption).
+    """
+    if feeder_mode not in ("walk", "bike", "drive"):
+        raise ValueError("Metro combos only support 'walk', 'bike', or 'drive'.")
+
+    combo_mode = f"metro+{feeder_mode}"
+    speed_kmh  = MODE_SPEED_KMH[feeder_mode]
+    ev         = events or []
+
+    sc = _geocode(source)
+    dc = _geocode(destination)
+
+    blocked = _extract_blocked_stations(ev)
+
+    # Candidate boarding/alighting stations — top 3 per line
+    all_lines = list(_LINE_STATIONS.keys())
+
+    def _top_n_on_line(lat: float, lon: float, line: str, n: int = 3) -> list[dict]:
+        stns = sorted(_LINE_STATIONS[line],
+                      key=lambda s: _haversine_km(lat, lon, s["lat"], s["lon"]))
+        return [s for s in stns[:n] if s["id"] not in blocked]
+
+    def _uniq_by_id(lst: list[dict]) -> list[dict]:
+        seen: set[str] = set(); out = []
+        for x in lst:
+            if x["id"] not in seen:
+                seen.add(x["id"]); out.append(x)
+        return out
+
+    src_candidates = _uniq_by_id(
+        [s for ln in all_lines for s in _top_n_on_line(sc[0], sc[1], ln, 2)]
+    )
+    dst_candidates = _uniq_by_id(
+        [s for ln in all_lines for s in _top_n_on_line(dc[0], dc[1], ln, 2)]
+    )
+
+    # Score all valid combinations
+    scored: list[tuple[float, dict, dict, list[dict], float, float]] = []
+    seen_sigs: set[tuple[str, ...]] = set()
+
+    for s_stn in src_candidates:
+        if s_stn["id"] in blocked:
+            continue
+        for d_stn in dst_candidates:
+            if d_stn["id"] in blocked or s_stn["id"] == d_stn["id"]:
+                continue
+            path = _metro_path_bfs(s_stn, d_stn, blocked_station_ids=blocked)
+            if not path or len(path) < 2:
+                continue
+            sig = tuple(st["id"] for st in path)
+            if sig in seen_sigs:
+                continue
+            seen_sigs.add(sig)
+            wk_src = _haversine_km(sc[0], sc[1], s_stn["lat"], s_stn["lon"])
+            wk_dst = _haversine_km(dc[0], dc[1], d_stn["lat"], d_stn["lon"])
+            score  = _score_metro_path(path, wk_src, wk_dst, ev)
+            # Add feeder-mode time penalty: faster feeder = lower score
+            feeder_km = wk_src + wk_dst
+            feeder_time_h = feeder_km / speed_kmh
+            score += feeder_time_h
+            scored.append((score, s_stn, d_stn, path, wk_src, wk_dst))
+
+    if not scored:
+        # No metro available — fall back to pure feeder mode
+        print(f"  [Metro] No metro path found, falling back to {feeder_mode} route")
+        return _road_routes(source, destination, feeder_mode, speed_kmh)
+
+    scored.sort(key=lambda x: x[0])
+    top = scored[:MAX_ROUTES]
+
+    routes_out = []
+    for rank, (score, s_stn, d_stn, path, wk_src, wk_dst) in enumerate(top):
+        n_ic = sum(1 for i in range(1, len(path)) if path[i]["line"] != path[i-1]["line"])
+        if rank == 0:
+            lbl = f"Best · Metro+{feeder_mode.title()}"
+        elif n_ic == 0:
+            lbl = f"Direct {path[0]['line'].title()} · {feeder_mode.title()} feeder"
+        else:
+            lbl = f"Via {n_ic} interchange{'s' if n_ic > 1 else ''} · {feeder_mode.title()} feeder"
+
+        r = _build_combo_route(
+            source=source, destination=destination, sc=sc, dc=dc,
+            src_stn=s_stn, dst_stn=d_stn, path=path,
+            wk_src_km=wk_src, wk_dst_km=wk_dst,
+            feeder_mode=feeder_mode, speed_kmh=speed_kmh,
+            route_id=rank, label=lbl, events=ev,
+        )
+        routes_out.append(r)
+
+    return {
+        "source": source, "destination": destination,
+        "src_coords": list(sc), "dst_coords": list(dc),
+        "mode": combo_mode, "routes": routes_out,
     }
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def get_routes_for_mode(source: str, destination: str, mode: TransportMode) -> dict:
-    """
-    Compute routes for the given transport mode.
+def _normalize_modes(modes: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for mode in modes:
+        if not isinstance(mode, str):
+            continue
+        m = mode.strip().lower()
+        if m and m not in normalized:
+            normalized.append(m)
+    return normalized
 
-    Returns a dict with shape:
-      {source, destination, src_coords, dst_coords, mode, routes: [...]}
 
-    The routes list has the same structure as route_engine.get_multiple_routes()
-    plus an extra `mode` key on each route dict.
-    """
+def get_routes_for_modes(
+    source: str,
+    destination: str,
+    modes: list[str],
+    events: list[dict] | None = None,
+) -> dict:
+    modes = _normalize_modes(modes)
+    if not modes:
+        raise ValueError("At least one transport mode must be provided.")
+    if len(modes) == 1:
+        return get_routes_for_mode(source, destination, modes[0], events=events)
+    if len(modes) == 2:
+        if "metro" not in modes:
+            raise ValueError("Two-mode routing supports only metro + walk/bike/drive.")
+        feeder = next(m for m in modes if m != "metro")
+        return _metro_combo_route(source, destination, feeder, events=events)
+    raise ValueError("Only one or two transport modes are supported.")
+
+
+def get_routes_for_mode(
+    source: str,
+    destination: str,
+    mode: TransportMode,
+    events: list[dict] | None = None,
+) -> dict:
     if mode == "drive":
-        return _road_routes(source, destination, "drive", MODE_SPEED_KMH["drive"])
-    elif mode == "walk":
-        return _road_routes(source, destination, "walk", MODE_SPEED_KMH["walk"])
-    elif mode == "bike":
-        return _road_routes(source, destination, "bike", MODE_SPEED_KMH["bike"])
-    elif mode == "metro":
-        return _metro_route(source, destination)
-    else:
-        raise ValueError(f"Unknown transport mode: {mode!r}. Use drive/walk/bike/metro.")
+        return _road_routes(source, destination, "drive", 30.0)
+    if mode == "walk":
+        return _road_routes(source, destination, "walk", 5.0)
+    if mode == "bike":
+        return _road_routes(source, destination, "bike", 15.0)
+    if mode == "metro":
+        return _metro_route(source, destination, events=events)
+    raise ValueError(f"Unknown mode: {mode!r}")
 
 
 def get_metro_geojson_overlay() -> dict:
-    """
-    Return a GeoJSON FeatureCollection of all metro lines for map overlay.
-    Each feature is a LineString for one line, coloured by line.
-    """
+    """GeoJSON overlay: all 5 metro lines + all stations."""
     features = []
-
-    for line_name, stations in [("blue", _BLUE_LINE), ("green", _GREEN_LINE)]:
+    for line_name, stations in _LINE_STATIONS.items():
         coords = [[s["lon"], s["lat"]] for s in stations]
         features.append({
             "type": "Feature",
             "geometry": {"type": "LineString", "coordinates": coords},
             "properties": {
                 "line":  line_name,
-                "color": LINE_COLORS[line_name],
-                "name":  f"Kolkata Metro {'Blue' if line_name == 'blue' else 'Green'} Line",
-            }
+                "color": LINE_COLORS.get(line_name, "#888"),
+                "name":  f"Kolkata Metro {line_name.title()} Line",
+            },
         })
-
-    # Station points
     for s in METRO_STATIONS:
         features.append({
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [s["lon"], s["lat"]]},
             "properties": {
-                "id":   s["id"],
-                "name": s["name"],
-                "line": s["line"],
-                "color": LINE_COLORS[s["line"]],
-            }
+                "id":    s["id"],
+                "name":  s["name"],
+                "line":  s["line"],
+                "color": LINE_COLORS.get(s["line"], "#888"),
+            },
         })
-
     return {"type": "FeatureCollection", "features": features}

@@ -34,8 +34,10 @@ from config import GRAPH_CACHE_PATH, MAX_ROUTES, MIN_ROUTE_DIVERGENCE, MAX_CONSE
 # ── Named places that together cover all 15 menu localities ──────────────────
 GRAPH_PLACES = [
     "Kolkata, West Bengal, India",
+    "Howrah, West Bengal, India",         # Howrah Station, Shibpur, Bally corridor
     "Bidhannagar, West Bengal, India",    # Salt Lake + New Town + Rajarhat
     "North Dum Dum, West Bengal, India",  # Dum Dum corridor
+    "Madhyamgram, West Bengal, India",    # NH-12 corridor bridging Dum Dum → Barasat
     "Barasat I, West Bengal, India",      # Barasat (north block)
     "Barasat II, West Bengal, India",     # Barasat (south block)
 ]
@@ -43,13 +45,21 @@ GRAPH_PLACES = [
 
 # ── Graph loader (cached) ─────────────────────────────────────────────────────
 
+# In-process graph cache
+_GRAPH_CACHE: dict[str, object] = {}
+
+
 def _load_graph():
     """
     Load the Kolkata + suburbs drive network.
     - First run  : downloads from OSM by place names, saves to pickle
     - Later runs : loads from the cached pickle file (~2 seconds)
+    The loaded graph is kept in memory for the lifetime of the process.
     """
     cache_path = GRAPH_CACHE_PATH
+
+    if cache_path in _GRAPH_CACHE:
+        return _GRAPH_CACHE[cache_path]
 
     if os.path.exists(cache_path):
         print(f"  [Route] Loading cached graph from {cache_path} ...")
@@ -60,6 +70,7 @@ def _load_graph():
     else:
         graph = _download_and_cache(cache_path)
 
+    _GRAPH_CACHE[cache_path] = graph
     return graph
 
 
