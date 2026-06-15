@@ -798,3 +798,89 @@ select option { background: #fff; }
   border-radius: 50%;
   flex-shrink: 0;
 }
+
+/* ==================================================
+   Disruption Zone Legend
+================================================== */
+
+.zone-legend {
+  position: fixed;
+  bottom: 52px;
+  right: 14px;
+  z-index: 900;
+  background: rgba(255,255,255,0.96);
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+  padding: 10px 13px 8px;
+  min-width: 148px;
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(0,0,0,0.07);
+  animation: fadeIn 0.3s ease;
+}
+
+.zleg-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #202124;
+  letter-spacing: 0.4px;
+  margin-bottom: 7px;
+  text-transform: uppercase;
+}
+
+.zleg-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 5px;
+  font-size: 12px;
+  color: #3c4043;
+}
+
+.zleg-swatch {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.zleg-count {
+  margin-left: auto;
+  font-weight: 600;
+  color: #5f6368;
+  font-size: 11px;
+}
+
+.zleg-note {
+  font-size: 10px;
+  color: #9aa0a6;
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid #f1f3f4;
+}
+
+/* Pulse ring animation for high severity markers */
+.pulse-ring {
+  animation: pulse 1.8s ease-out infinite;
+}
+
+@keyframes pulse {
+  0%   { opacity: 0.5; transform: scale(1); }
+  70%  { opacity: 0;   transform: scale(1.6); }
+  100% { opacity: 0;   transform: scale(1.6); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Route-specific vs Area-wide split */
+.sec-badge { display:inline-block; font-size:10px; font-weight:700; padding:1px 7px; border-radius:10px; margin-left:6px; vertical-align:middle; }
+.sec-badge.specific { background:#e8f0fe; color:#1a73e8; }
+.sec-badge.area { background:#fce8e6; color:#c5221f; }
+.area-sec { cursor:pointer; user-select:none; display:flex; align-items:center; gap:4px; }
+.area-toggle { margin-left:auto; font-size:10px; color:#9aa0a6; }
+.area-events-list { display:none; }
+.area-wide-ev { opacity:0.75; border-left:3px solid #e0e0e0 !important; }
+.area-tag { background:#f1f3f4; color:#5f6368; font-size:9px; padding:1px 5px; border-radius:8px; margin-left:4px; font-weight:600; }
+.hgnn-tag { background:#e6f4ea; color:#137333; font-size:9px; padding:1px 5px; border-radius:8px; margin-left:4px; font-weight:600; }

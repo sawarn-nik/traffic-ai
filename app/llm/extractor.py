@@ -47,6 +47,14 @@ MAX_LLM_CALLS_PER_RUN = 20   # ~5 min of quota at 4 req/min
 _last_call_end_time: float = 0.0   # time when the last call FINISHED
 _llm_call_count: int = 0           # total LLM calls made this run
 
+
+def reset_llm_budget() -> None:
+    """Reset the per-run LLM call counter. Call once at the start of each
+    /api/disruptions request so the budget is per-request, not per-process."""
+    global _llm_call_count
+    _llm_call_count = 0
+
+
 # ── Shared parser ─────────────────────────────────────────────────────────────
 _parser = PydanticOutputParser(pydantic_object=TrafficEventSchema)
 
@@ -349,6 +357,14 @@ def extract_event(
                 return result
 
     # ── LLM extraction for unstructured text sources ──────────────────────────
+    # Check global call budget before attempting any LLM call.
+    # TomTom/HERE direct extractions above don't count against this budget.
+    global _llm_call_count
+    if _llm_call_count >= MAX_LLM_CALLS_PER_RUN:
+        print(f"[Extractor] LLM budget exhausted ({MAX_LLM_CALLS_PER_RUN} calls) "
+              f"— skipping remaining articles this run.")
+        return None
+
     _current_text = text
     primary, fallback = _get_chains()
     payload = {
@@ -363,7 +379,8 @@ def extract_event(
 
         try:
             result = primary.invoke(payload)
-            _last_call_end_time = time.monotonic()   # record end time on success
+            _last_call_end_time = time.monotonic()
+            _llm_call_count += 1   # count successful call against budget
             if result is None:
                 raise ValueError("Primary chain returned None — trying fallback")
             return result
@@ -379,6 +396,7 @@ def extract_event(
                     _pace_call()
                     result = fallback.invoke(payload)
                     _last_call_end_time = time.monotonic()
+                    _llm_call_count += 1
                     if result is not None:
                         return result
                 except Exception as fe:

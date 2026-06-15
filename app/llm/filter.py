@@ -272,7 +272,13 @@ def semantic_deduplicate_events(results: list[dict]) -> list[dict]:
         event_type = r.get("event_type", "unknown")
         road = (r.get("road_name") or "").lower().strip()[:40]
         loc  = (r.get("location") or "").lower().strip()[:30]
-        return f"{event_type}|{road}|{loc}"
+        # Include a reason snippet so two different incidents on the same generic
+        # road ("Kolkata (city-wide)") don't collapse into one event.
+        # Without this, all RSS/NewsAPI articles that share road_name="Kolkata
+        # (city-wide)" reduce to a single event regardless of what happened,
+        # causing all non-TomTom routes to receive the exact same risk score.
+        reason_snippet = (r.get("reason") or "").lower().strip()[:40]
+        return f"{event_type}|{road}|{loc}|{reason_snippet}"
 
     def _priority(r: dict) -> tuple:
         """Lower tuple = higher priority (kept over others)."""
@@ -346,17 +352,24 @@ def filter_by_route_relevance(
     source: str = "",
     destination: str = "",
     route_coords: list[tuple[float, float]] | None = None,
-    corridor_km: float = 2.0,
+    corridor_km: float = 1.0,
 ) -> tuple[list[dict], list[dict]]:
     """
     Split events into route-relevant and city-wide using spatial filtering.
 
     Strategy (in priority order):
       1. TomTom/HERE events WITH coordinates → check if lat/lon falls within
-         a corridor bounding box around the route (default ±2 km buffer).
+         a corridor bounding box around the route (1 km buffer for Kolkata's
+         dense road network — 2 km caused all central routes to match identically).
          If no route_coords provided, falls back to road name matching.
       2. TomTom/HERE events WITHOUT coordinates → road name matching.
       3. All other sources → road name / location text matching.
+
+    Token matching rules (tightened to avoid false positives in dense city):
+      - Full road names always match (e.g. "park street" matches "park street")
+      - Individual word tokens require ≥ 6 chars (was 4) to avoid common short
+        words like "road", "lane", "park", "bose" matching across different roads
+      - Generic location words are excluded from the token set
 
     Args:
         results:      All extracted events
@@ -364,7 +377,7 @@ def filter_by_route_relevance(
         source:       Journey source locality name
         destination:  Journey destination locality name
         route_coords: List of (lat, lon) for each OSMnx node on the route
-        corridor_km:  Buffer around route bbox in km (default 2 km)
+        corridor_km:  Buffer around route bbox in km (default 1 km)
 
     Returns:
         (route_events, citywide_events) tuple
@@ -372,23 +385,62 @@ def filter_by_route_relevance(
     if not results:
         return [], []
 
+    # Generic words that appear in many road names and cause false positives.
+    # These must NOT be used as standalone match tokens.
+    _GENERIC_ROAD_WORDS = {
+        "road", "lane", "street", "avenue", "sarani", "marg", "path",
+        "nagar", "para", "bazar", "bagan", "ghat", "more", "gate",
+        "north", "south", "east", "west", "new", "old", "main",
+        "park", "lake", "town", "city", "ring", "link", "cross",
+        "bose", "roy", "das", "sen", "lal", "pur", "pore",
+    }
+
     # Build spatial corridor if route coordinates are available
     corridor = _build_route_corridor(route_coords, buffer_km=corridor_km) if route_coords else None
 
-    # Build road name token set for text-based fallback
-    route_tokens: set[str] = set()
+    # Build two-tier token set:
+    #   full_names  — complete road/place names (highest precision)
+    #   word_tokens — individual words ≥ 6 chars, excluding generic words
+    full_names:  set[str] = set()
+    word_tokens: set[str] = set()
+
     for road in (route_roads or []):
-        route_tokens.add(road.lower())
-        for word in road.lower().split():
-            if len(word) >= 4:
-                route_tokens.add(word)
+        r_lower = road.lower().strip()
+        full_names.add(r_lower)
+        for word in r_lower.split():
+            if len(word) >= 6 and word not in _GENERIC_ROAD_WORDS:
+                word_tokens.add(word)
 
     for place in (source, destination):
         if place:
-            route_tokens.add(place.lower())
-            for word in place.lower().split():
-                if len(word) >= 4:
-                    route_tokens.add(word)
+            p_lower = place.lower().strip()
+            full_names.add(p_lower)
+            for word in p_lower.split():
+                if len(word) >= 6 and word not in _GENERIC_ROAD_WORDS:
+                    word_tokens.add(word)
+
+    def _matches_route(event_road: str, event_loc: str) -> bool:
+        """
+        Return True if the event road/location matches this route.
+
+        Two-pass check:
+          1. Full road name substring match (high precision)
+          2. Significant word token match (≥ 6 chars, non-generic)
+        """
+        combined = (event_road + " " + event_loc).lower()
+
+        # Pass 1: full road name
+        for name in full_names:
+            if len(name) >= 6 and name in combined:
+                return True
+
+        # Pass 2: significant word tokens
+        combined_words = set(combined.split())
+        for token in word_tokens:
+            if token in combined_words:   # whole-word match only
+                return True
+
+        return False
 
     route_events: list[dict] = []
     citywide_events: list[dict] = []
@@ -414,9 +466,8 @@ def filter_by_route_relevance(
         # ── Road name / location text matching ────────────────────────────────
         event_road = (r.get("road_name") or "").lower()
         event_loc  = (r.get("location") or "").lower()
-        combined   = event_road + " " + event_loc
 
-        if any(token in combined for token in route_tokens if len(token) >= 4):
+        if _matches_route(event_road, event_loc):
             route_events.append(r)
         else:
             citywide_events.append(r)
