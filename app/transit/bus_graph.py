@@ -29,9 +29,36 @@ def load_bus_routes():
 
     return data
 
+def build_bus_graph():
+    """
+    Build adjacency-list graph from bus routes.
+    """
+
+    routes = load_bus_routes()
+
+    graph = {}
+
+    for route in routes:
+
+        stops = route["stops"]
+
+        for i in range(len(stops) - 1):
+
+            a = stops[i]
+            b = stops[i + 1]
+
+            graph.setdefault(a, []).append(b)
+            graph.setdefault(b, []).append(a)
+
+    return graph
+
 if __name__ == "__main__":
+
     print("Stops:")
     print(load_bus_stops())
 
     print("\nRoutes:")
     print(load_bus_routes())
+
+    print("\nGraph:")
+    print(build_bus_graph())
