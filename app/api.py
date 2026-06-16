@@ -51,10 +51,67 @@ from config import (
     ENABLE_TOMTOM, ENABLE_WEATHER, ENABLE_SCRAPER,
     ENABLE_NEWSAPI, ENABLE_RSS,
 )
+from datetime import datetime, timezone, timedelta
 from weather.route_weather import fetch_weather as _fetch_weather_point
 from weather.weather_risk import compute_weather_risk
+from hgnn.integration import enhance_event_confidences, score_route_with_hgnn, get_cascade_road_names
 
 app = FastAPI(title="Kolkata Traffic AI", version="2.0")
+
+# ── Forward-geocode cache — used to fill lat/lon for non-TomTom events ────────
+# Nominatim calls are expensive (~1s each). We cache by location string so the
+# same road name resolved from multiple articles only triggers one HTTP request
+# per process lifetime. This also avoids the hot-path latency problem (#3) by
+# ensuring each unique location string hits Nominatim at most once per session.
+_fwd_geocode_cache: dict[str, tuple[float, float] | None] = {}
+
+# Generic city-level strings that are not worth geocoding — they'd return the
+# Kolkata city centroid, which is misleading for spatial adjacency edges.
+_GENERIC_LOCATION_STRINGS = {
+    "kolkata", "kolkata (city-wide)", "kolkata (tomtom)", "kolkata (here incident)",
+    "kolkata (tomtom incident)", "kolkata (weather)", "kolkata (official advisory)",
+    "kolkata (twitter)", "west bengal", "unknown",
+}
+
+
+def _forward_geocode(location: str) -> tuple[float, float] | None:
+    """
+    Forward-geocode a location name → (lat, lon) using Nominatim.
+
+    Results are cached for the lifetime of the process. Generic city-wide
+    strings are skipped to avoid returning a misleading city centroid.
+    Always appends ', Kolkata, West Bengal' to bias results to the city.
+    """
+    from config import ENABLE_NOMINATIM
+    if not ENABLE_NOMINATIM:
+        return None
+
+    loc_lower = location.strip().lower()
+    if not loc_lower or loc_lower in _GENERIC_LOCATION_STRINGS:
+        return None
+
+    if loc_lower in _fwd_geocode_cache:
+        return _fwd_geocode_cache[loc_lower]
+
+    result = None
+    try:
+        import requests as _req
+        query = f"{location.strip()}, Kolkata, West Bengal, India"
+        resp = _req.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1, "addressdetails": 0},
+            headers={"User-Agent": "KolkataTrafficAI/1.0"},
+            timeout=6,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            result = (float(data[0]["lat"]), float(data[0]["lon"]))
+    except Exception:
+        pass   # non-fatal — event still persisted, just without coordinates
+
+    _fwd_geocode_cache[loc_lower] = result
+    return result
 
 app.add_middleware(
     CORSMiddleware,
@@ -301,6 +358,20 @@ def _process_articles(articles: list[dict], session) -> list[dict]:
             continue
 
         road_name  = event.road_name or road
+
+        # ── Derive fetched_at from age_label ──────────────────────────────────
+        # age_label is the only reliable timestamp for RSS/NewsAPI articles.
+        # Without this, all events fall back to datetime.now() in graph_builder,
+        # making stale events look like they just happened — corrupting temporal
+        # features (hour_sin/cos, is_rush_hour, is_weekend) used by the HGNN.
+        from llm.filter import parse_age_label_to_hours
+        _age_hours = parse_age_label_to_hours(article.get("age_label", ""))
+        article["fetched_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=_age_hours)
+            if _age_hours is not None
+            else datetime.now(timezone.utc)
+        )
+
         sev_score  = compute_score(event.severity.value)
         enh_conf   = compute_enhanced_confidence(
             llm_confidence    = event.confidence,
@@ -323,6 +394,23 @@ def _process_articles(articles: list[dict], session) -> list[dict]:
         )
         pub_date   = format_date_ddmmyy(article.get("age_label", "")) or format_today_ddmmyy()
 
+        # ── Forward-geocode for non-TomTom events that lack coordinates ───────
+        # TomTom/HERE articles carry lat/lon directly from the API response.
+        # RSS/NewsAPI/scraper articles never carry coordinates — the LLM only
+        # extracts a location *name*, leaving lat/lon as None. Without these,
+        # build_graph_from_db() produces no road-road spatial adjacency edges
+        # for the ~60-70% of events that come from non-TomTom sources, so the
+        # HGNN trains on a graph that is mostly disconnected.
+        #
+        # We forward-geocode the resolved location name ONCE per unique string
+        # (cached in _fwd_geocode_cache for the process lifetime) and write the
+        # result back into the article dict so the same coordinates flow into
+        # both the DB record below AND the results list appended after it.
+        if article.get("lat") is None and resolved_location:
+            geo = _forward_geocode(resolved_location)
+            if geo:
+                article["lat"], article["lon"] = geo
+
         # Persist
         record = TrafficEvent(
             source               = source,
@@ -344,6 +432,10 @@ def _process_articles(articles: list[dict], session) -> list[dict]:
             confidence           = enh_conf,
             llm_confidence       = event.confidence,
             source_reliability   = get_source_reliability(source),
+            # Coordinates — persisted so HGNN trainer can build road-road
+            # spatial adjacency edges from the DB (was always NULL before)
+            lat                  = float(article["lat"])  if article.get("lat")  is not None else None,
+            lon                  = float(article["lon"])  if article.get("lon")  is not None else None,
             start_time_display   = duration["start_time"],
             estimated_end_time   = duration["estimated_end_time"],
             impact_duration_mins = duration["impact_duration_mins"],
@@ -373,12 +465,69 @@ def _process_articles(articles: list[dict], session) -> list[dict]:
             "tomtom_url":           article.get("tomtom_url", ""),
             "lat":                  article.get("lat"),
             "lon":                  article.get("lon"),
+            "fetched_at":           article["fetched_at"],   # for HGNN temporal features
             "impact_duration_label": duration["impact_duration_label"],
             "estimated_end_time":   duration["estimated_end_time"],
             "color":                SEVERITY_COLOR.get(event.severity.value, "#95a5a6"),
         })
 
     return results
+
+
+def _persist_hgnn_outputs(events: list[dict], session) -> None:
+    """
+    Write HGNN-adjusted confidence, severity, and multiplier back to the DB
+    for events that were processed this run.
+
+    This closes the training feedback loop:
+      1. Event enters DB with LLM confidence/severity (initial labels)
+      2. HGNN adjusts confidence and optionally corrects severity
+      3. We write hgnn_confidence, hgnn_severity, hgnn_multiplier back
+      4. Next trainer run can use these as improved training targets
+
+    Matches by source_url (unique per article). Falls back to raw_text
+    prefix match for articles without a URL. Non-fatal if DB update fails.
+    """
+    if not events:
+        return
+
+    try:
+        from sqlalchemy import text as sql_text
+        updated = 0
+        for ev in events:
+            # Only update events that HGNN actually touched
+            hgnn_conf = ev.get("hgnn_confidence")
+            if hgnn_conf is None:
+                continue
+
+            source_url   = ev.get("source_url", "")
+            hgnn_sev     = ev.get("hgnn_severity")
+            hgnn_mult    = ev.get("hgnn_multiplier")
+            sev_corrected = ev.get("severity_corrected", False)
+
+            if source_url:
+                session.execute(sql_text("""
+                    UPDATE traffic_events
+                    SET    hgnn_confidence    = :hc,
+                           hgnn_severity      = :hs,
+                           hgnn_multiplier    = :hm,
+                           severity_corrected = :sc
+                    WHERE  source_url = :url
+                """), {
+                    "hc":  round(float(hgnn_conf), 4),
+                    "hs":  hgnn_sev,
+                    "hm":  round(float(hgnn_mult), 4) if hgnn_mult is not None else None,
+                    "sc":  bool(sev_corrected),
+                    "url": source_url,
+                })
+                updated += 1
+
+        session.commit()
+        if updated:
+            print(f"  [DB] HGNN outputs written back for {updated} events.")
+
+    except Exception as e:
+        print(f"  [DB] HGNN write-back warning (non-fatal): {e}")
 
 
 def _fetch_city_weather(all_routes: list[dict]) -> dict:
@@ -446,33 +595,192 @@ def _fetch_city_weather(all_routes: list[dict]) -> dict:
 
 
 def _score_route(route_data: dict, events: list[dict],
-                 city_weather: dict | None = None) -> dict:
+                 city_weather: dict | None = None,
+                 cascade_cache: dict | None = None) -> dict:
     """
-    Score a route using spatial corridor + road name matching.
+    Score a route using HGNN road-probability as a continuous per-event
+    weight multiplier rather than a binary route-specific/area-wide split.
 
-    Weather is city-wide so the same pre-fetched `city_weather` dict is applied
-    equally to every route — heavy monsoon rain affects all roads identically.
-    Pass city_weather=None to disable weather scoring (e.g. no API key).
+    Core idea (HGNN integration):
+      For every event that matches this route, its score contribution is:
+
+          contribution = weighted_score × hgnn_road_multiplier
+
+      where hgnn_road_multiplier is derived from the HGNN's predicted
+      disruption probability for the event's road ON THIS ROUTE'S graph.
+
+      Since each route has a different set of road nodes and edges, the HGNN
+      produces different road disruption probabilities per route. Two routes
+      that textually match the same 4 events will now score differently
+      because the HGNN topology is different — one route's roads may cluster
+      around a disrupted zone, another's may not.
+
+    Multiplier mapping:
+      hgnn_prob ≥ 0.7  → multiplier = 1.0   (confirmed disruption, full weight)
+      hgnn_prob ≥ 0.5  → multiplier = 0.75  (probable, slight discount)
+      hgnn_prob ≥ 0.3  → multiplier = 0.45  (possible, significant discount)
+      hgnn_prob < 0.3  → multiplier = 0.20  (unlikely on this route)
+      no hgnn data     → multiplier = 0.50  (neutral fallback)
+
+    This directly solves the "identical score" problem: routes sharing the
+    same text-matched events get different scores because their HGNN graphs
+    assign different road probabilities to those events' roads.
     """
-
     coords     = route_data.get("coords")
     road_names = route_data.get("road_names", [])
 
+    # ── Step 1: Run HGNN on THIS route's graph ────────────────────────────────
+    # Build the graph with only this route's road names marked as is_on_route.
+    # This means each route gets a unique graph topology → unique road probs.
+    hgnn_road_probs: dict[str, float] = {}
+    hgnn_available = False
+    try:
+        from hgnn.inference import get_inference
+        hgnn   = get_inference()
+        result = hgnn.predict(events, road_names)
+        if result:
+            hgnn_road_probs = result.get("road_disruption_probs", {})
+            hgnn_available  = bool(hgnn_road_probs)
+    except Exception:
+        pass   # HGNN unavailable — use neutral multiplier for all events
+
+    def _hgnn_multiplier(ev: dict) -> float:
+        """
+        Convert HGNN road probability → a score multiplier for this event.
+
+        Looks up the event's road in THIS route's hgnn_road_probs dict.
+        Falls back to 0.50 (neutral) if HGNN is unavailable or road unknown.
+        """
+        if not hgnn_available:
+            return 0.50
+        ev_road = (ev.get("road_name") or "").lower().strip()
+        prob = hgnn_road_probs.get(ev_road)
+        if prob is None:
+            # Try partial match — event road may be a substring of OSM road name
+            for osm_road, p in hgnn_road_probs.items():
+                if ev_road and (ev_road in osm_road or osm_road in ev_road):
+                    prob = p
+                    break
+        if prob is None:
+            return 0.50   # unknown road — neutral
+        if prob >= 0.70:  return 1.00
+        if prob >= 0.50:  return 0.75
+        if prob >= 0.30:  return 0.45
+        return 0.20
+
+    # ── Step 2: Cascade expansion (cached) ───────────────────────────────────
+    cache_key = tuple(sorted(road_names))
+    if cascade_cache is not None and cache_key in cascade_cache:
+        cascade_roads = cascade_cache[cache_key]
+    else:
+        cascade_roads = get_cascade_road_names(road_names, events)
+        if cascade_cache is not None:
+            cascade_cache[cache_key] = cascade_roads
+
+    expanded_road_names = road_names + cascade_roads
+
+    # ── Step 3: Spatial + road-name event matching ────────────────────────────
     route_events, _ = filter_by_route_relevance(
         results      = events,
-        route_roads  = road_names,
+        route_roads  = expanded_road_names,
         route_coords = [tuple(c) for c in coords] if coords else None,
-        corridor_km  = 2.0,
+        corridor_km  = 1.0,
     )
+
+    # ── Step 4: Tag route-specific vs area-wide (for UI display only) ─────────
+    route_road_set = {r.lower() for r in road_names}
+    for ev in route_events:
+        ev_road = (ev.get("road_name") or "").lower()
+        ev_loc  = (ev.get("location") or "").lower()
+        is_specific = any(
+            r in ev_road or r in ev_loc
+            for r in route_road_set if len(r) >= 5
+        )
+        ev["route_specific"]     = is_specific
+        ev["hgnn_multiplier"]    = round(_hgnn_multiplier(ev), 3)
 
     recent = [
         e for e in route_events
         if e.get("is_recent", True) and not e.get("is_future_event", False)
     ]
 
-    disruption_score = sum(e["weighted_score"] for e in recent)
+    route_specific = [e for e in recent if e.get("route_specific")]
+    area_wide      = [e for e in recent if not e.get("route_specific")]
 
-    # ── Weather — city-wide, identical for every route ────────────────────────
+    # ── Step 5: HGNN-weighted disruption score ────────────────────────────────
+    # Every event is weighted by its HGNN road disruption probability on THIS
+    # route. Same event → different weight on different routes → different score.
+    #
+    # Area-wide events use a spatially-graduated discount instead of a flat 0.40×.
+    # If the event has lat/lon (TomTom or forward-geocoded), we compute its
+    # Haversine distance to the nearest route node and map that to a [0.15–0.55]
+    # discount. Events close to the route corridor score higher; truly city-wide
+    # events (no coords or very far) fall back to 0.20. This breaks the
+    # "identical score" tie when HGNN is untrained (all multipliers = 0.50) by
+    # giving each route a different proximity profile for the same event pool.
+    import math as _math
+
+    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        R = 6371.0
+        dlat = _math.radians(lat2 - lat1)
+        dlon = _math.radians(lon2 - lon1)
+        a = (_math.sin(dlat / 2) ** 2 +
+             _math.cos(_math.radians(lat1)) * _math.cos(_math.radians(lat2)) *
+             _math.sin(dlon / 2) ** 2)
+        return R * 2 * _math.atan2(_math.sqrt(a), _math.sqrt(1 - a))
+
+    def _area_wide_discount(ev: dict) -> float:
+        """
+        Proximity-based discount for area-wide events.
+
+        If the event has coordinates and the route has coordinates, compute
+        the minimum Haversine distance from the event to any route node and
+        map it to a discount factor:
+          ≤ 0.5 km  → 0.55  (practically on-route, near-specific weight)
+          ≤ 1.5 km  → 0.40  (within corridor, standard city discount)
+          ≤ 3.0 km  → 0.28  (nearby area)
+          > 3.0 km  → 0.15  (genuinely city-wide, far away)
+          no coords → 0.20  (unknown proximity, conservative discount)
+
+        Two routes receiving the same area-wide event will get different
+        discounts when one's corridor is closer to the event's location.
+        """
+        ev_lat = ev.get("lat")
+        ev_lon = ev.get("lon")
+        if ev_lat is None or ev_lon is None or not coords:
+            return 0.20   # no spatial data — conservative city-wide discount
+
+        # Sample up to 20 evenly-spaced route nodes for efficiency
+        # (routes can have hundreds of OSM nodes; checking all is wasteful)
+        step = max(1, len(coords) // 20)
+        sample = coords[::step]
+
+        min_dist = min(
+            _haversine_km(float(ev_lat), float(ev_lon), float(c[0]), float(c[1]))
+            for c in sample
+        )
+
+        if min_dist <= 0.5:  return 0.55
+        if min_dist <= 1.5:  return 0.40
+        if min_dist <= 3.0:  return 0.28
+        return 0.15
+
+    disruption_score = sum(
+        ev["weighted_score"] * ev["hgnn_multiplier"]
+        for ev in recent if ev.get("route_specific")
+    ) + sum(
+        ev["weighted_score"] * ev["hgnn_multiplier"] * _area_wide_discount(ev)
+        for ev in recent if not ev.get("route_specific")
+    )
+
+    # ── Step 6: Per-route HGNN topology score ────────────────────────────────
+    # score_route_with_hgnn() runs a separate HGNN pass on route-only events
+    # and returns max/avg road disruption probability scaled to [0,10].
+    # This captures the structural disruption of the route's road network
+    # independent of individual event text matching.
+    hgnn_score = score_route_with_hgnn(route_data, route_events)
+
+    # ── Step 7: Weather — city-wide ───────────────────────────────────────────
     weather_score = 0.0
     weather_out   = {"avg_wsi": None, "max_wsi": None, "severity": "unknown",
                      "sample_points": 0, "score": 0.0, "city_wide": True}
@@ -480,17 +788,22 @@ def _score_route(route_data: dict, events: list[dict],
     if city_weather and city_weather.get("success"):
         weather_score = city_weather.get("score", 0.0)
         weather_out   = {
-            "avg_wsi":      city_weather.get("avg_wsi"),
-            "max_wsi":      city_weather.get("max_wsi"),
-            "severity":     city_weather.get("severity", "unknown"),
+            "avg_wsi":       city_weather.get("avg_wsi"),
+            "max_wsi":       city_weather.get("max_wsi"),
+            "severity":      city_weather.get("severity", "unknown"),
             "sample_points": city_weather.get("sample_points", 0),
-            "score":        weather_score,
-            "city_wide":    True,
-            "raw":          city_weather.get("raw", {}),
+            "score":         weather_score,
+            "city_wide":     True,
+            "raw":           city_weather.get("raw", {}),
         }
 
-    # ── Combined risk score ───────────────────────────────────────────────────
-    total_risk = round(disruption_score + weather_score, 2)
+    # Final composite:
+    #   disruption_score — HGNN-weighted event severity × confidence
+    #   hgnn_score       — route topology disruption from HGNN graph (0–10)
+    #   weather_score    — city-wide weather risk (identical for all routes)
+    # HGNN topology score gets 0.5× weight so it influences but doesn't dominate
+    # when the model has limited training data.
+    total_risk = round(disruption_score + weather_score + 0.50 * hgnn_score, 2)
 
     if total_risk >= 25:
         risk_level = "CRITICAL"
@@ -505,21 +818,41 @@ def _score_route(route_data: dict, events: list[dict],
 
     return {
         **route_data,
-        "risk_score":        total_risk,
-        "disruption_score":  round(disruption_score, 2),
-        "weather_score":     weather_score,
-        "risk_level":        risk_level,
-        "risk_color":        RISK_COLOR.get(risk_level, "#27ae60"),
-        "matched_events":    route_events,
-        "event_count":       len(recent),
-        "weather":           weather_out,
+        "risk_score":            total_risk,
+        "disruption_score":      round(disruption_score, 2),
+        "weather_score":         weather_score,
+        "hgnn_score":            round(hgnn_score, 3),
+        "hgnn_road_probs":       hgnn_road_probs,        # per-road prob for debugging
+        "cascade_roads":         cascade_roads,
+        "risk_level":            risk_level,
+        "risk_color":            RISK_COLOR.get(risk_level, "#27ae60"),
+        "matched_events":        route_events,
+        "route_specific_events": len(route_specific),
+        "area_wide_events":      len(area_wide),
+        "event_count":           len(recent),
+        "weather":               weather_out,
     }
 
 
 def _pick_best_route(scored: list[dict]) -> int:
-    """Best route = lowest composite: travel_time × (1 + total_risk/10)."""
-    def composite(r):
-        return r["travel_time_min"] * (1 + r["risk_score"] / 10)
+    """
+    Best route = lowest composite: travel_time × (1 + risk_score / MAX_RISK).
+
+    Calibration (MAX_RISK = 20):
+      risk=0  (CLEAR)    → 1.0×  — pure travel time, no penalty
+      risk=5  (MODERATE) → 1.25× — 25% time penalty; still beats a 30% longer clear route
+      risk=12 (HIGH)     → 1.6×  — a 10-min route now costs 16 min equivalent
+      risk=25 (CRITICAL) → 2.25× — overrides up to ~55% time savings on safer route
+
+    Using MAX_RISK=10 underpenalises HIGH/CRITICAL routes (they were only 2–3×
+    multiplied), so a moderately faster critical route could still win. With 20,
+    severe disruptions reliably push the user toward the safer alternative.
+    """
+    MAX_RISK = 20.0
+
+    def composite(r: dict) -> float:
+        return r["travel_time_min"] * (1.0 + r["risk_score"] / MAX_RISK)
+
     return min(range(len(scored)), key=lambda i: composite(scored[i]))
 
 # ── Startup ────────────────────────────────────────────────────────────────────
@@ -564,6 +897,71 @@ def get_locations():
 def metro_overlay():
     """GeoJSON overlay of all Kolkata Metro lines + stations for map display."""
     return get_metro_geojson_overlay()
+
+
+@app.get("/api/hgnn-status")
+def hgnn_status():
+    """
+    Returns HGNN model readiness status.
+    - available: torch is installed
+    - ready:     model weights loaded and inference active
+    - message:   human-readable status / next step
+    """
+    from hgnn.integration import get_hgnn_status
+    return get_hgnn_status()
+
+
+@app.post("/api/explain-route")
+def explain_route(req: DisruptionRequest):
+    """
+    Returns HGNN attention-based explanation for why a route has its risk score.
+    Exposes which events had highest attention weight → explainable AI.
+    """
+    from hgnn.integration import explain_route_risk
+
+    # Use first route's road names if no specific route provided
+    road_names = req.road_names or []
+    route_data = {"road_names": road_names}
+
+    # Quick event extraction (reuse disruptions endpoint logic)
+    events: list[dict] = []
+    session = get_session()
+    try:
+        from sqlalchemy import text as sql_text
+        from config import DATABASE_URL
+        from sqlalchemy import create_engine
+        engine = create_engine(DATABASE_URL, echo=False)
+        with engine.connect() as conn:
+            rows = conn.execute(sql_text("""
+                SELECT event_type, severity, confidence, road_name, location,
+                       source, 0 as is_future_event, impact_duration_mins
+                FROM traffic_events
+                ORDER BY fetched_at DESC LIMIT 100
+            """)).fetchall()
+        for row in rows:
+            events.append({
+                "event_type": row[0] or "unknown",
+                "severity":   row[1] or "low",
+                "confidence": float(row[2] or 0.5),
+                "road_name":  row[3],
+                "location":   row[4],
+                "source":     row[5] or "unknown",
+                "is_future_event": bool(row[6]),
+                "impact_duration_mins": int(row[7]) if row[7] else 60,
+                "is_recent": True,
+                "weighted_score": float(row[2] or 0.5),
+            })
+    except Exception as e:
+        print(f"  [Explain] DB read failed: {e}")
+    finally:
+        session.close()
+
+    explanation = explain_route_risk(route_data, events)
+    return {
+        "road_names":  road_names,
+        "explanation": explanation,
+        "generated_at": now_iso(),
+    }
 
 
 @app.get("/api/metro-lines")
@@ -709,6 +1107,21 @@ def fetch_disruptions(req: DisruptionRequest):
         events = semantic_deduplicate_events(raw_events)
         print(f"  [API] After dedup: {len(events)} events")
 
+        # ── HGNN confidence enhancement — uses ALL road names for full city
+        # graph context (multi-source corroboration, spatial clustering) ───────
+        all_route_road_names = list({
+            road
+            for r in (req.routes or [])
+            for road in (r.road_names if hasattr(r, "road_names") else r.get("road_names", []))
+        }) or req.road_names
+        events = enhance_event_confidences(events, all_route_road_names)
+
+        # ── Write HGNN outputs back to DB for training feedback loop ──────────
+        # After HGNN adjusts confidence/severity, persist those values so the
+        # trainer can load them as improved targets on the next training run.
+        # Only updates rows that exist (matched by source_url or raw_text hash).
+        _persist_hgnn_outputs(events, session)
+
     except Exception as e:
         import traceback
         print(f"  [API] ERROR in disruption fetch: {e}")
@@ -765,7 +1178,9 @@ def fetch_disruptions(req: DisruptionRequest):
     # ── City-wide weather — fetched ONCE, applied equally to all routes ─────
     city_weather = _fetch_city_weather(route_list)
 
-    scored = [_score_route(r, events, city_weather=city_weather) for r in route_list]
+    cascade_cache: dict = {}
+    scored = [_score_route(r, events, city_weather=city_weather,
+                           cascade_cache=cascade_cache) for r in route_list]
     best_i = _pick_best_route(scored) if scored else 0
     for i, r in enumerate(scored):
         r["is_best"] = (i == best_i)

@@ -1,0 +1,3 @@
+# Model weights are saved here after training.
+# Run: python -m hgnn.trainer
+# The generated model.pt file is in .gitignore (too large to commit).

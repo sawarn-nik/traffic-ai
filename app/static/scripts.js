@@ -22,10 +22,19 @@ const MODE_LABEL = {
   drive: '🚗 Drive', walk: '🚶 Walk', bike: '🚲 Bike', metro: '🚇 Metro'
 };
 
+// Disruption zone colors by severity
+const ZONE_COLOR = {
+  high:   { fill: '#c5221f', stroke: '#8b0000' },
+  medium: { fill: '#e37400', stroke: '#b35900' },
+  low:    { fill: '#fbbc04', stroke: '#c49800' },
+};
+const ZONE_RADIUS = { high: 420, medium: 320, low: 220 };  // metres
+
 // ── State ────────────────────────────────────────────────────────────────────
 let routeLayers     = [];
 let pinLayers       = [];
 let markerLayers    = [];
+let zoneLayers      = [];   // disruption area zones
 let overlayLayers   = [];          // metro line/station overlay
 let currentRoutes   = [];
 let activeIdx       = 0;
@@ -566,20 +575,120 @@ function updateRouteColors(routes) {
 
 function drawMarkers(markers) {
   markerLayers.forEach(l => map.removeLayer(l));
+  zoneLayers.forEach(l => map.removeLayer(l));
   markerLayers = [];
-  markers.forEach(m => {
-    if (!m.lat || !m.lon) return;
-    const mk = L.circleMarker([m.lat, m.lon], {
-      radius: 8, color: '#fff', weight: 1.5,
-      fillColor: m.color || '#ea4335', fillOpacity: 0.9,
+  zoneLayers   = [];
+
+  // ── Group markers by severity for zone drawing ────────────────────────────
+  const withCoords = markers.filter(m => m.lat && m.lon);
+
+  // Draw area zones first (underneath markers)
+  withCoords.forEach(m => {
+    const sev   = m.severity || 'low';
+    const zc    = ZONE_COLOR[sev] || ZONE_COLOR.low;
+    const zr    = ZONE_RADIUS[sev] || 220;
+
+    // Outer glow circle (large, very transparent)
+    const glow = L.circle([m.lat, m.lon], {
+      radius:      zr * 2.2,
+      color:       zc.fill,
+      weight:      0,
+      fillColor:   zc.fill,
+      fillOpacity: 0.06,
+      interactive: false,
     }).addTo(map);
-    mk.bindPopup(
-      `<b>${m.event_type.replace(/_/g, ' ').toUpperCase()}</b><br>` +
-      `📍 ${m.location}<br>${m.reason}<br>` +
-      `<small>${m.age_label} · ${m.source}</small>`
+    zoneLayers.push(glow);
+
+    // Main zone circle
+    const zone = L.circle([m.lat, m.lon], {
+      radius:      zr,
+      color:       zc.stroke,
+      weight:      1.2,
+      opacity:     0.5,
+      fillColor:   zc.fill,
+      fillOpacity: 0.18,
+      dashArray:   sev === 'high' ? null : '4 3',
+    }).addTo(map);
+
+    zone.bindTooltip(
+      `<b style="color:${zc.fill}">${sev.toUpperCase()} — ${m.event_type.replace(/_/g,' ')}</b><br>` +
+      `📍 ${m.location}`,
+      { sticky: true, opacity: 0.95 }
     );
+    zoneLayers.push(zone);
+  });
+
+  // Draw point markers on top of zones
+  withCoords.forEach(m => {
+    const sev  = m.severity || 'low';
+    const zc   = ZONE_COLOR[sev] || ZONE_COLOR.low;
+    const icon = { accident:'💥', congestion:'🚗', road_closure:'🚧',
+                   construction:'🏗️', protest:'✊', weather:'🌧️',
+                   waterlogging:'💧', vip_movement:'🚨', metro_disruption:'🚇',
+                   train_delay:'🚂', transport_strike:'✋', diversion:'↪️' };
+    const emoji = icon[m.event_type] || '⚠️';
+
+    // Pulse ring for high severity
+    if (sev === 'high') {
+      const pulse = L.circleMarker([m.lat, m.lon], {
+        radius: 14, color: zc.fill, weight: 2,
+        fillColor: 'transparent', fillOpacity: 0, opacity: 0.4,
+        className: 'pulse-ring',
+      }).addTo(map);
+      zoneLayers.push(pulse);
+    }
+
+    // Emoji icon marker
+    const mk = L.marker([m.lat, m.lon], {
+      icon: L.divIcon({
+        html: `
+          <div style="
+            background:${zc.fill};
+            border:2px solid ${zc.stroke};
+            border-radius:50%;
+            width:28px;height:28px;
+            display:flex;align-items:center;justify-content:center;
+            font-size:14px;
+            box-shadow:0 2px 6px rgba(0,0,0,0.35);
+            cursor:pointer;
+          ">${emoji}</div>`,
+        className: '',
+        iconSize:   [28, 28],
+        iconAnchor: [14, 14],
+      }),
+    }).addTo(map);
+
+    const srcLabel = m.source === 'tomtom_traffic' ? '📡 TomTom Live'
+                   : m.source === 'newsapi'         ? '📰 NewsAPI'
+                   :                                  '📡 RSS';
+    const dur = m.duration ? ` · ${m.duration}` : '';
+    const urlLink = m.tomtom_url
+      ? `<br><a href="${m.tomtom_url}" target="_blank" style="font-size:10px;color:#1a73e8">View on TomTom ↗</a>`
+      : '';
+
+    mk.bindPopup(`
+      <div style="min-width:180px">
+        <div style="font-weight:700;color:${zc.fill};margin-bottom:4px">
+          ${emoji} ${m.event_type.replace(/_/g,' ').toUpperCase()}
+          ${m.is_future ? ' <span style="background:#e8f0fe;color:#1a73e8;padding:1px 5px;border-radius:8px;font-size:10px">Upcoming</span>' : ''}
+        </div>
+        <div style="font-size:12px;margin-bottom:3px">📍 <b>${m.location}</b></div>
+        <div style="font-size:12px;color:#3c4043;margin-bottom:5px">${m.reason}</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="background:${zc.fill}22;color:${zc.fill};padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600">
+            ${sev.toUpperCase()}
+          </span>
+          <span style="font-size:10px;color:#5f6368">${m.age_label}${dur}</span>
+        </div>
+        <div style="font-size:10px;color:#5f6368;margin-top:4px">${srcLabel}${urlLink}</div>
+      </div>
+    `, { maxWidth: 260 });
+
     markerLayers.push(mk);
   });
+
+  // ── Draw disruption zone legend ───────────────────────────────────────────
+  _updateZoneLegend(withCoords);
 }
 
 // ── Panel rendering ───────────────────────────────────────────────────────────
@@ -668,9 +777,19 @@ function buildRouteCard(r, i, ready, markers, mode) {
   } else if (evtCount === 0) {
     evtClass = 'ok'; evtIcon = '✓'; evtText = 'No disruptions';
   } else if (riskLevel === 'HIGH' || riskLevel === 'CRITICAL') {
-    evtClass = 'critical'; evtIcon = '⛔'; evtText = `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
+    const specific = r.route_specific_events || 0;
+    const area     = r.area_wide_events || 0;
+    evtClass = 'critical'; evtIcon = '⛔';
+    evtText  = specific > 0
+      ? `${specific} on route · ${area} area-wide`
+      : `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
   } else {
-    evtClass = 'warn'; evtIcon = '⚠'; evtText = `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
+    const specific = r.route_specific_events || 0;
+    const area     = r.area_wide_events || 0;
+    evtClass = 'warn'; evtIcon = '⚠';
+    evtText  = specific > 0
+      ? `${specific} on route · ${area} area-wide`
+      : `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
   }
 
   // Subtitle
@@ -834,15 +953,42 @@ function buildExpandedDetail(r, ready) {
   }
 
   if (ready) {
-    const active = (r.matched_events || []).filter(e => !e.is_future_event);
-    const future = (r.matched_events || []).filter(e =>  e.is_future_event);
+    const allActive = (r.matched_events || []).filter(e => !e.is_future_event);
+    const future    = (r.matched_events || []).filter(e =>  e.is_future_event);
 
-    html += `<div class="expand-sec">Disruptions on this Route (${active.length})</div>`;
-    if (active.length === 0) {
+    // Split into route-specific and area-wide
+    const specific  = allActive.filter(e => e.route_specific);
+    const areaWide  = allActive.filter(e => !e.route_specific);
+
+    if (allActive.length === 0) {
+      html += '<div class="expand-sec">Disruptions on this Route (0)</div>';
       html += '<div class="expand-clear">✓ No active disruptions</div>';
     } else {
-      active.forEach(ev => { html += buildEventCard(ev); });
+      // Route-specific disruptions
+      if (specific.length > 0) {
+        html += `
+        <div class="expand-sec">
+          On This Route
+          <span class="sec-badge specific">${specific.length}</span>
+        </div>`;
+        specific.forEach(ev => { html += buildEventCard(ev); });
+      }
+
+      // Area-wide disruptions (collapsible)
+      if (areaWide.length > 0) {
+        const areaId = `area-${r.id || Math.random()}`;
+        html += `
+        <div class="expand-sec area-sec" onclick="toggleAreaEvents('${areaId}')">
+          Area-wide (affect all routes)
+          <span class="sec-badge area">${areaWide.length}</span>
+          <span class="area-toggle" id="tog-${areaId}">▼</span>
+        </div>
+        <div id="${areaId}" class="area-events-list">`;
+        areaWide.forEach(ev => { html += buildEventCard(ev, false, true); });
+        html += '</div>';
+      }
     }
+
     if (future.length > 0) {
       html += `<div class="expand-sec">Upcoming (${future.length})</div>`;
       future.forEach(ev => { html += buildEventCard(ev, true); });
@@ -859,15 +1005,26 @@ function buildExpandedDetail(r, ready) {
   return html;
 }
 
-function buildEventCard(ev, isFuture = false) {
+function toggleAreaEvents(id) {
+  const el  = document.getElementById(id);
+  const tog = document.getElementById('tog-' + id);
+  if (!el) return;
+  const hidden = el.style.display === 'none' || el.style.display === '';
+  el.style.display   = hidden ? 'block' : 'none';
+  if (tog) tog.textContent = hidden ? '▲' : '▼';
+}
+
+function buildEventCard(ev, isFuture = false, isAreaWide = false) {
   const isLive = ev.source === 'tomtom_traffic';
   const dur    = ev.impact_duration_label ? ` · ${ev.impact_duration_label}` : '';
   const src    = isLive ? '📡 TomTom Live' : ev.source === 'newsapi' ? '📰 NewsAPI' : '📡 RSS';
-  const ftag   = isFuture ? '<span class="future-tag">Upcoming</span>' : '';
+  const ftag   = isFuture  ? '<span class="future-tag">Upcoming</span>' : '';
+  const atag   = isAreaWide ? '<span class="area-tag">Area-wide</span>'  : '';
+  const corrTag = ev.severity_corrected ? '<span class="hgnn-tag">HGNN ✓</span>' : '';
   return `
-  <div class="ev-item ${ev.severity}">
+  <div class="ev-item ${ev.severity} ${isAreaWide ? 'area-wide-ev' : ''}">
     <div class="ev-head">
-      <span class="ev-type" style="color:${ev.color || '#5f6368'}">${ev.event_type.replace(/_/g, ' ')}${ftag}</span>
+      <span class="ev-type" style="color:${ev.color || '#5f6368'}">${ev.event_type.replace(/_/g, ' ')}${ftag}${atag}${corrTag}</span>
       <span class="ev-age">${ev.age_label || ''}</span>
     </div>
     <div class="ev-loc">📍 ${ev.location}</div>
@@ -936,7 +1093,11 @@ function clearMap() {
   routeLayers.forEach(l => map.removeLayer(l));
   pinLayers.forEach(l => map.removeLayer(l));
   markerLayers.forEach(l => map.removeLayer(l));
-  routeLayers = []; pinLayers = []; markerLayers = [];
+  zoneLayers.forEach(l => map.removeLayer(l));
+  routeLayers = []; pinLayers = []; markerLayers = []; zoneLayers = [];
+  // Remove zone legend
+  const leg = document.getElementById('zone-legend');
+  if (leg) leg.remove();
 }
 
 function pin(emoji) {
@@ -959,6 +1120,43 @@ function toast(msg) {
   const t = document.getElementById('toast');
   t.innerText = msg; t.style.display = 'block';
   setTimeout(() => t.style.display = 'none', 3500);
+}
+
+// ── Disruption zone legend ────────────────────────────────────────────────────
+function _updateZoneLegend(markers) {
+  // Remove old legend
+  const old = document.getElementById('zone-legend');
+  if (old) old.remove();
+
+  if (!markers || markers.length === 0) return;
+
+  const counts = { high: 0, medium: 0, low: 0 };
+  markers.forEach(m => {
+    const s = m.severity || 'low';
+    if (counts[s] !== undefined) counts[s]++;
+  });
+
+  const rows = Object.entries(counts)
+    .filter(([, c]) => c > 0)
+    .map(([sev, cnt]) => {
+      const zc = ZONE_COLOR[sev] || ZONE_COLOR.low;
+      return `
+      <div class="zleg-row">
+        <div class="zleg-swatch" style="background:${zc.fill};border:1.5px solid ${zc.stroke}"></div>
+        <span>${sev.charAt(0).toUpperCase()+sev.slice(1)}</span>
+        <span class="zleg-count">${cnt}</span>
+      </div>`;
+    }).join('');
+
+  const leg = document.createElement('div');
+  leg.id        = 'zone-legend';
+  leg.className = 'zone-legend';
+  leg.innerHTML = `
+    <div class="zleg-title">Disruption Zones</div>
+    ${rows}
+    <div class="zleg-note">Radius = severity</div>
+  `;
+  document.body.appendChild(leg);
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────

@@ -15,7 +15,8 @@ class TrafficEvent(Base):
 
     Maps to Layer 1 output: structured event with severity σ and confidence κ.
     Enhanced with: location inference metadata, impact duration, date formatting,
-    multi-factor confidence, and transport relevance flag.
+    multi-factor confidence, transport relevance flag, coordinates, and
+    HGNN-adjusted confidence/severity for training feedback.
     """
     __tablename__ = "traffic_events"
 
@@ -40,12 +41,26 @@ class TrafficEvent(Base):
     time_mentioned  = Column(String(100), nullable=True)
     is_future_event = Column(Boolean,     default=False)
 
+    # ── Coordinates — critical for HGNN road-road spatial adjacency ───────────
+    # Without these, build_graph_from_db() produces no road-road edges during
+    # training, meaning the HGNN learns without any spatial graph structure.
+    lat             = Column(Float,       nullable=True)   # WGS84 latitude
+    lon             = Column(Float,       nullable=True)   # WGS84 longitude
+
     # ── Severity σ(t) and confidence κ(t) — core Layer 1 outputs ─────────────
     severity        = Column(String(10),  nullable=False, default="low")
     severity_score  = Column(Integer,     nullable=False, default=1)   # 2/5/10
     confidence      = Column(Float,       nullable=False, default=0.0) # κ ∈ [0,1]
     llm_confidence  = Column(Float,       nullable=True)               # raw LLM κ
     source_reliability = Column(Float,    nullable=True)               # source score
+
+    # ── HGNN-adjusted outputs — stored for training feedback loop ─────────────
+    # Comparing pre/post HGNN values over time lets us validate whether the
+    # graph adjustments are moving in the right direction.
+    hgnn_confidence   = Column(Float,      nullable=True)  # HGNN-adjusted κ
+    hgnn_severity     = Column(String(10), nullable=True)  # HGNN-predicted severity
+    hgnn_multiplier   = Column(Float,      nullable=True)  # road disruption prob used
+    severity_corrected = Column(Boolean,   default=False)  # True if HGNN overrode LLM
 
     # ── Impact duration ───────────────────────────────────────────────────────
     start_time_display    = Column(String(20),  nullable=True)   # DD/MM/YY
@@ -59,6 +74,7 @@ class TrafficEvent(Base):
             f"<TrafficEvent id={self.id} type={self.event_type} "
             f"road={self.road_name} severity={self.severity} "
             f"confidence={self.confidence:.2f} "
+            f"lat={self.lat} lon={self.lon} "
             f"duration={self.impact_duration_label}>"
         )
 
@@ -71,8 +87,44 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 def init_db():
-    """Create all tables if they don't exist yet."""
+    """
+    Create all tables if they don't exist yet.
+    Also runs a safe column migration for existing databases — adds any new
+    columns (lat, lon, hgnn_confidence, etc.) without dropping existing data.
+    """
     Base.metadata.create_all(engine)
+    _migrate_add_columns()
+
+
+def _migrate_add_columns():
+    """
+    Safely add new columns to an existing traffic_events table.
+    Uses PRAGMA table_info to check existing columns before ALTER TABLE,
+    so this is safe to call on both fresh and legacy databases.
+    """
+    new_columns = [
+        ("lat",                "REAL"),
+        ("lon",                "REAL"),
+        ("hgnn_confidence",    "REAL"),
+        ("hgnn_severity",      "VARCHAR(10)"),
+        ("hgnn_multiplier",    "REAL"),
+        ("severity_corrected", "BOOLEAN DEFAULT 0"),
+    ]
+    try:
+        with engine.connect() as conn:
+            from sqlalchemy import text
+            result   = conn.execute(text("PRAGMA table_info(traffic_events)"))
+            existing = {row[1] for row in result}   # column names
+            for col_name, col_type in new_columns:
+                if col_name not in existing:
+                    conn.execute(text(
+                        f"ALTER TABLE traffic_events ADD COLUMN {col_name} {col_type}"
+                    ))
+                    print(f"  [DB] Migrated: added column '{col_name}' to traffic_events")
+            conn.commit()
+    except Exception as e:
+        # Non-fatal — new installs use create_all above, migration only for upgrades
+        print(f"  [DB] Migration warning (non-fatal): {e}")
 
 
 def get_session():
