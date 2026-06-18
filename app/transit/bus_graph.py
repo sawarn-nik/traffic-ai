@@ -1,64 +1,95 @@
-import json
+import csv
 from pathlib import Path
-
 
 DATA_DIR = Path(__file__).parent / "data"
 
 
-def load_bus_stops():
-    """
-    Load bus stops from JSON.
-    """
+def load_stops():
+    stops = {}
 
-    file_path = DATA_DIR / "bus_stops.json"
+    with open(DATA_DIR / "stops.csv", encoding="utf-8") as f:
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        reader = csv.DictReader(f)
 
-    return data
+        for row in reader:
 
-def load_bus_routes():
-    """
-    Load bus routes from JSON.
-    """
+            stops[row["stop_id"]] = {
+                "name": row["stop_name"],
+                "lat": float(row["lat"]),
+                "lon": float(row["lon"])
+            }
 
-    file_path = DATA_DIR / "bus_routes.json"
+    return stops
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
 
-    return data
+def load_routes():
+
+    routes = {}
+
+    with open(DATA_DIR / "routes.csv", encoding="utf-8") as f:
+
+        reader = csv.DictReader(f)
+
+        for row in reader:
+
+            routes[row["route_id"]] = row
+
+    return routes
+
+
+def load_route_sequences():
+
+    sequences = {}
+
+    with open(DATA_DIR / "route_stop_sequence.csv", encoding="utf-8") as f:
+
+        reader = csv.DictReader(f)
+
+        for row in reader:
+
+            route_id = row["route_id"]
+
+            sequences.setdefault(route_id, []).append(
+                (
+                    int(row["stop_sequence"]),
+                    row["stop_id"]
+                )
+            )
+
+    return sequences
+
 
 def build_bus_graph():
-    """
-    Build adjacency-list graph from bus routes.
-    """
-
-    routes = load_bus_routes()
 
     graph = {}
 
-    for route in routes:
+    sequences = load_route_sequences()
 
-        stops = route["stops"]
+    for route_id, stops in sequences.items():
+
+        stops.sort()
 
         for i in range(len(stops) - 1):
 
-            a = stops[i]
-            b = stops[i + 1]
+            current_stop = stops[i][1]
+            next_stop = stops[i + 1][1]
 
-            graph.setdefault(a, []).append(b)
-            graph.setdefault(b, []).append(a)
+            graph.setdefault(current_stop, []).append(next_stop)
+            graph.setdefault(next_stop, []).append(current_stop)
 
     return graph
 
+
 if __name__ == "__main__":
 
-    print("Stops:")
-    print(load_bus_stops())
+    graph = build_bus_graph()
 
-    print("\nRoutes:")
-    print(load_bus_routes())
+    print("\nTotal Nodes:", len(graph))
 
-    print("\nGraph:")
-    print(build_bus_graph())
+    total_edges = sum(len(v) for v in graph.values()) // 2
+
+    print("Total Edges:", total_edges)
+
+    print("\nEsplanade Connections:")
+
+    print(graph.get("S_ESPL"))
