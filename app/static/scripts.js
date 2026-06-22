@@ -16,27 +16,40 @@ const RISK_COLOR = {
   MODERATE: '#e37400', HIGH: '#c5221f', CRITICAL: '#7c4dff'
 };
 const MODE_COLOR = {
-  drive: '#1a73e8', walk: '#34a853', bike: '#e37400', metro: '#7c4dff'
+  drive: '#1a73e8', walk: '#34a853', bike: '#e37400', metro: '#7c4dff', bus: '#FF5722'
 };
 const MODE_LABEL = {
-  drive: '🚗 Drive', walk: '🚶 Walk', bike: '🚲 Bike', metro: '🚇 Metro'
+  drive: 'Drive', walk: 'Walk', bike: 'Bike', metro: 'Metro', bus: 'Bus'
 };
+
+// Disruption zone colors by severity
+const ZONE_COLOR = {
+  high:   { fill: '#c5221f', stroke: '#8b0000' },
+  medium: { fill: '#e37400', stroke: '#b35900' },
+  low:    { fill: '#fbbc04', stroke: '#c49800' },
+};
+const ZONE_RADIUS = { high: 420, medium: 320, low: 220 };  // metres
 
 // ── State ────────────────────────────────────────────────────────────────────
 let routeLayers     = [];
 let pinLayers       = [];
 let markerLayers    = [];
-let overlayLayers   = [];          // metro line/station overlay
+let zoneLayers      = [];   // disruption area zones
+let overlayLayers   = [];   // metro line/station overlay
+let busOverlayLayers = [];  // bus stop markers + route polylines
 let currentRoutes   = [];
 let activeIdx       = 0;
 let currentMode     = 'drive';
 let currentComboMode = '';
 let disruptionsLoaded   = false;
 let lastDisruptionData  = null;
+let _busNetwork         = null;  // cached {routes, stops} from /api/bus-network
 
 // ── Mode selector ────────────────────────────────────────────────────────────
 function setMode(mode) {
-  if (mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive') {
+  const prevMode = currentMode;
+
+  if (mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive' || mode === 'metro+walk+drive') {
     currentMode = 'metro';
     currentComboMode = mode;
   } else {
@@ -49,20 +62,32 @@ function setMode(mode) {
   });
 
   // Update input placeholders for the new mode
-  _syncPlaceholders(mode.startsWith('metro') ? 'metro' : mode);
+  _syncPlaceholders(mode);
 
-  if (mode === 'metro' || mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive') {
-    loadMetroOverlay();
-    document.getElementById('map-legend').classList.add('visible');
-  } else {
-    clearOverlay();
-    document.getElementById('map-legend').classList.remove('visible');
+  // ── Bus overlay: show all stops + routes when bus tab is selected ──────────
+  if (mode === 'bus') {
+    loadBusOverlay();
+    document.getElementById('bus-legend').style.display  = '';
+    document.getElementById('map-legend').style.display  = 'none';
+  } else if (prevMode === 'bus') {
+    // Leaving bus mode — remove bus overlay, restore empty-state panel
+    clearBusOverlay();
+    document.getElementById('bus-legend').style.display  = 'none';
+    document.getElementById('map-legend').style.display  = '';
+    document.getElementById('panel').innerHTML = `
+      <div class="empty-state">
+        <div class="icon">🗺️</div>
+        <p>Choose your start and end points.<br>AI traffic routes appear here.</p>
+      </div>`;
   }
+
+  // Metro overlay is always visible — no-op here, loaded once on boot
 }
 
 // ── Load locations ───────────────────────────────────────────────────────────
 let _allLocations  = [];   // {id, name, desc}
 let _metroStations = [];   // {id, name, desc, line, color}
+let _busStops      = [];   // {id, name, desc, lat, lon}
 
 // Current confirmed values (what was actually selected, not just typed)
 let _srcValue = '';
@@ -73,7 +98,8 @@ async function loadLocations() {
     const data = await (await fetch('/api/locations')).json();
     _allLocations  = data.locations      || [];
     _metroStations = data.metro_stations || [];
-    console.log(`[locations] ${_allLocations.length} localities, ${_metroStations.length} metro stations loaded`);
+    _busStops      = data.bus_stops      || [];
+    console.log(`[locations] ${_allLocations.length} localities, ${_metroStations.length} metro stations, ${_busStops.length} bus stops loaded`);
     _syncPlaceholders(currentMode);
   } catch(e) {
     console.error('[locations] fetch failed:', e);
@@ -82,44 +108,72 @@ async function loadLocations() {
 }
 
 function _syncPlaceholders(mode) {
-  document.getElementById('src-input').placeholder =
-    mode === 'metro' ? 'Source metro station' : 'Source location or station';
-  document.getElementById('dst-input').placeholder =
-    mode === 'metro' ? 'Destination metro station' : 'Destination location or station';
+  const isCombo = mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive' || mode === 'metro+walk+drive';
+  const hint = mode === 'metro'
+    ? 'metro station'
+    : isCombo
+      ? 'locality or metro station'
+      : mode === 'bus'
+        ? 'bus stop or locality'
+        : 'location';
+  document.getElementById('src-input').placeholder = `Source ${hint}`;
+  document.getElementById('dst-input').placeholder = `Destination ${hint}`;
 }
 
 // Build the flat option list for a given mode
 function _buildOptions(mode) {
   const opts = [];
+  // For pure metro: only stations. For combo (metro+walk/bike/drive) and
+  // all other modes: show localities first, then all metro stations.
+  const isCombo = mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive' || mode === 'metro+walk+drive';
+  const isBus   = mode === 'bus';
 
   if (mode !== 'metro') {
     // Localities group
-    opts.push({ _group: '📍 Kolkata Localities' });
+    const localityLabel = isBus
+      ? '📍 Kolkata Localities & Bus Stops'
+      : isCombo
+        ? '📍 Kolkata Localities & Metro Stations'
+        : '📍 Kolkata Localities';
+    opts.push({ _group: localityLabel });
     _allLocations.forEach(l => opts.push({ name: l.name, desc: l.desc, type: 'locality' }));
   }
 
-  // Metro stations grouped by line
-  const LINE_META = {
-    blue:   { label: '🔵 Blue Line (North–South)',          color: '#2196F3' },
-    green:  { label: '🟢 Green Line (East–West)',            color: '#4CAF50' },
-    purple: { label: '🟣 Purple Line (Joka–Majerhat)',       color: '#9C27B0' },
-    orange: { label: '🟠 Orange Line (Kavi Subhash–Beleghata)', color: '#FF9800' },
-    yellow: { label: '🟡 Yellow Line (Noapara–Jai Hind)',    color: '#FFC107' },
-  };
-  const lineOrder = ['blue', 'green', 'purple', 'orange', 'yellow'];
-
-  lineOrder.forEach(line => {
-    const stns = _metroStations.filter(s => s.line === line);
-    if (!stns.length) return;
-    opts.push({ _group: LINE_META[line]?.label || line });
-    stns.forEach(s => opts.push({
+  // Bus stops — only shown in bus mode
+  if (isBus && _busStops.length) {
+    opts.push({ _group: '🚌 Bus Stops' });
+    _busStops.forEach(s => opts.push({
       name:  s.name,
-      desc:  s.desc,
-      type:  'metro',
-      line:  s.line,
-      color: s.color || LINE_META[line]?.color || '#888',
+      desc:  s.desc || 'Bus stop',
+      type:  'bus',
+      color: '#FF5722',
     }));
-  });
+  }
+
+  // Metro stations grouped by line — shown for metro / combo modes
+  if (!isBus) {
+    const LINE_META = {
+      blue:   { label: '🔵 Blue Line (North-South)',              color: '#2196F3' },
+      green:  { label: '🟢 Green Line (East-West)',               color: '#4CAF50' },
+      purple: { label: '🟣 Purple Line (Joka-Majerhat)',          color: '#9C27B0' },
+      orange: { label: '🟠 Orange Line (Kavi Subhash-Beleghata)', color: '#FF9800' },
+      yellow: { label: '🟡 Yellow Line (Noapara-Jai Hind)',       color: '#FFC107' },
+    };
+    const lineOrder = ['blue', 'green', 'purple', 'orange', 'yellow'];
+
+    lineOrder.forEach(line => {
+      const stns = _metroStations.filter(s => s.line === line);
+      if (!stns.length) return;
+      opts.push({ _group: LINE_META[line]?.label || line });
+      stns.forEach(s => opts.push({
+        name:  s.name,
+        desc:  s.desc,
+        type:  'metro',
+        line:  s.line,
+        color: s.color || LINE_META[line]?.color || '#888',
+      }));
+    });
+  }
 
   return opts;
 }
@@ -127,7 +181,9 @@ function _buildOptions(mode) {
 // Render the dropdown list, optionally filtered by query
 function _renderDropdown(which, query) {
   const dd   = document.getElementById(`${which}-dropdown`);
-  const mode = currentMode;
+  // For combo modes (metro+walk/bike/drive) use the full combo mode so
+  // _buildOptions knows to include both localities AND metro stations.
+  const mode = currentComboMode || currentMode;
   const opts = _buildOptions(mode);
   const q    = (query || '').toLowerCase().trim();
 
@@ -170,6 +226,10 @@ function _renderDropdown(which, query) {
     if (opt.type === 'metro') {
       row.innerHTML = `
         <span class="loc-opt-dot" style="background:${opt.color}"></span>
+        <span>${opt.name}</span>`;
+    } else if (opt.type === 'bus') {
+      row.innerHTML = `
+        <span class="loc-opt-dot" style="background:#FF5722"></span>
         <span>${opt.name}</span>`;
     } else {
       row.innerHTML = `
@@ -358,6 +418,242 @@ function clearOverlay() {
   overlayLayers = [];
 }
 
+// ── Bus overlay ──────────────────────────────────────────────────────────────
+function clearBusOverlay() {
+  busOverlayLayers.forEach(l => map.removeLayer(l));
+  busOverlayLayers = [];
+}
+
+async function loadBusOverlay() {
+  // Show the panel directory immediately (skeleton while loading)
+  renderBusNetworkPanel(null);
+
+  // Use cached data if available
+  if (_busNetwork) {
+    drawBusOverlay(_busNetwork);
+    renderBusNetworkPanel(_busNetwork);
+    return;
+  }
+
+  try {
+    const data = await (await fetch('/api/bus-network')).json();
+    _busNetwork = data;
+    drawBusOverlay(data);
+    renderBusNetworkPanel(data);
+  } catch (e) {
+    console.warn('[bus] overlay failed:', e);
+    renderBusNetworkPanel({ routes: [], stops: [], error: true });
+  }
+}
+
+// Route-type colour palette for bus lines on the map
+const BUS_TYPE_COLOR = {
+  'AC':         '#1a73e8',   // blue
+  'Government': '#34a853',   // green
+  'Non-AC':     '#FF5722',   // deep orange
+  'Mini':       '#9c27b0',   // purple
+};
+
+function drawBusOverlay(data) {
+  clearBusOverlay();
+
+  const routes = data.routes || [];
+  const stops  = data.stops  || [];
+
+  // ── Draw route polylines (thin, semi-transparent, colour by type) ──────────
+  routes.forEach(route => {
+    if (!route.coords || route.coords.length < 2) return;
+    const color = BUS_TYPE_COLOR[route.route_type] || '#FF5722';
+    // coords are [lon, lat] — L.geoJSON expects [lat, lon], convert
+    const latlngs = route.coords.map(([lon, lat]) => [lat, lon]);
+    const line = L.polyline(latlngs, {
+      color,
+      weight:    3,
+      opacity:   0.55,
+      dashArray: '6 4',
+    }).addTo(map);
+    line.bindTooltip(
+      `<b>🚌 ${route.route_name}</b><br>${route.num_stops} stops`,
+      { sticky: true }
+    );
+    busOverlayLayers.push(line);
+  });
+
+  // ── Draw stop circle-markers (small orange dots with popup) ───────────────
+  stops.forEach(stop => {
+    const mk = L.circleMarker([stop.lat, stop.lon], {
+      radius:      5,
+      color:       '#fff',
+      weight:      1.5,
+      fillColor:   '#FF5722',
+      fillOpacity: 0.9,
+    }).addTo(map);
+
+    // Find which routes serve this stop for the popup
+    const servingRoutes = routes
+      .filter(r => r.stops.some(s => s.stop_id === stop.stop_id))
+      .map(r => `<div style="font-size:11px;color:#555;margin-top:2px">
+          <span style="background:${BUS_TYPE_COLOR[r.route_type] || '#FF5722'}22;
+            color:${BUS_TYPE_COLOR[r.route_type] || '#FF5722'};
+            border-radius:4px;padding:1px 5px;font-size:10px;font-weight:600">
+            ${r.route_type}
+          </span>
+          ${r.route_name}
+        </div>`)
+      .join('');
+
+    mk.bindPopup(`
+      <div style="min-width:180px">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <div style="background:#FF5722;width:10px;height:10px;border-radius:50%"></div>
+          <b style="font-size:13px">${stop.name}</b>
+        </div>
+        <div style="font-size:10px;color:#9aa0a6;margin-bottom:4px">Bus Stop</div>
+        ${servingRoutes || '<div style="font-size:11px;color:#9aa0a6">No route data</div>'}
+      </div>`);
+
+    busOverlayLayers.push(mk);
+  });
+}
+
+// ── Bus network panel (shown when bus mode is active but no route searched yet)
+function renderBusNetworkPanel(data) {
+  const panel = document.getElementById('panel');
+
+  if (!data) {
+    // Loading skeleton
+    panel.innerHTML = `
+      <div class="sec-lbl">🚌 Bus Network</div>
+      <div class="loading-row">
+        <div class="spinner"></div>
+        <span>Loading bus routes &amp; stops…</span>
+      </div>`;
+    return;
+  }
+
+  if (data.error || !data.routes) {
+    panel.innerHTML = `
+      <div class="sec-lbl">🚌 Bus Network</div>
+      <div class="empty-state"><div class="icon">⚠️</div>
+        <p>Could not load bus network data.</p></div>`;
+    return;
+  }
+
+  const routes = data.routes || [];
+  const stops  = data.stops  || [];
+
+  // Type colour helper
+  const typeColor  = t => BUS_TYPE_COLOR[t] || '#FF5722';
+  const typeBadge  = t => `
+    <span style="background:${typeColor(t)}22;color:${typeColor(t)};
+      border:1px solid ${typeColor(t)}44;
+      border-radius:5px;padding:1px 6px;font-size:10px;font-weight:600">
+      ${t || '—'}
+    </span>`;
+
+  let html = `
+  <div class="sec-lbl">🚌 Kolkata Bus Network</div>
+  <div style="font-size:11px;color:#9aa0a6;padding:0 12px 10px">
+    ${routes.length} routes · ${stops.length} stops — tap a route to see stops
+  </div>`;
+
+  routes.forEach((route, ri) => {
+    const color     = typeColor(route.route_type);
+    const stopNames = route.stops.map(s => s.name).join(' → ');
+    const firstStop = route.stops[0]?.name  || '?';
+    const lastStop  = route.stops[route.stops.length - 1]?.name || '?';
+    const detailId  = `bus-route-${ri}`;
+
+    html += `
+    <div class="route-card" style="cursor:pointer" onclick="toggleBusRouteDetail('${detailId}', ${ri})">
+      <div class="rc-top">
+        <div class="rc-num" style="background:${color};color:#fff;font-size:10px;min-width:28px">🚌</div>
+        <div class="rc-title">
+          <div class="rc-label" style="font-size:12px">${route.route_name}</div>
+          <div class="rc-subtitle">${firstStop} → ${lastStop}</div>
+        </div>
+        ${typeBadge(route.route_type)}
+      </div>
+      <div class="rc-stats">
+        <div class="stat-chip">${route.num_stops}<span class="lbl"> stops</span></div>
+      </div>
+
+      <!-- Expandable stop list -->
+      <div id="${detailId}" style="display:none;margin-top:6px">
+        <div class="expand-sec">All Stops</div>
+        <div class="road-node-list">`;
+
+    route.stops.forEach((stop, si) => {
+      const isFirst = si === 0;
+      const isLast  = si === route.stops.length - 1;
+      const dot     = isFirst ? 'node-dot-start' : isLast ? 'node-dot-end' : 'node-dot-mid';
+      html += `
+          <div class="road-node-row">
+            <div class="node-track">
+              <div class="node-dot ${dot}" style="${isFirst||isLast ? `background:${color}` : ''}"></div>
+              ${!isLast ? `<div class="node-line" style="background:${color}44"></div>` : ''}
+            </div>
+            <div class="node-label">
+              ${isFirst ? '<b>' : ''}${stop.name}${isFirst ? '</b>' : ''}
+              ${isFirst ? `<span style="font-size:10px;color:${color};font-weight:600;margin-left:4px">Start</span>` : ''}
+              ${isLast  ? `<span style="font-size:10px;color:${color};font-weight:600;margin-left:4px">End</span>`   : ''}
+            </div>
+          </div>`;
+    });
+
+    html += `
+        </div>
+      </div>
+    </div>`;
+  });
+
+  panel.innerHTML = html;
+}
+
+// Draw only stop markers (no route polylines) — used after a route search
+// so stops remain visible alongside the computed route line.
+function drawBusStopsOnly(stops) {
+  clearBusOverlay();
+  if (!stops || !_busNetwork) return;
+  const routes = _busNetwork.routes || [];
+  stops.forEach(stop => {
+    const mk = L.circleMarker([stop.lat, stop.lon], {
+      radius: 4, color: '#fff', weight: 1.2,
+      fillColor: '#FF5722', fillOpacity: 0.85,
+    }).addTo(map);
+    const servingRoutes = routes
+      .filter(r => r.stops.some(s => s.stop_id === stop.stop_id))
+      .map(r => `<div style="font-size:11px;color:#555;margin-top:2px">
+        <span style="background:${(BUS_TYPE_COLOR[r.route_type]||'#FF5722')}22;
+          color:${BUS_TYPE_COLOR[r.route_type]||'#FF5722'};
+          border-radius:4px;padding:1px 5px;font-size:10px;font-weight:600">${r.route_type}</span>
+        ${r.route_name}</div>`)
+      .join('');
+    mk.bindPopup(`<div style="min-width:160px">
+      <b style="font-size:12px">${stop.name}</b>
+      <div style="font-size:10px;color:#9aa0a6;margin:2px 0 4px">Bus Stop</div>
+      ${servingRoutes || '<div style="font-size:11px;color:#9aa0a6">No route data</div>'}
+    </div>`);
+    busOverlayLayers.push(mk);
+  });
+}
+
+function toggleBusRouteDetail(id, routeIdx) {  const el = document.getElementById(id);
+  if (!el) return;
+  const isOpen = el.style.display !== 'none';
+  el.style.display = isOpen ? 'none' : 'block';
+
+  // Pan map to highlight this route's polyline
+  if (!isOpen && _busNetwork && busOverlayLayers.length) {
+    const route = _busNetwork.routes[routeIdx];
+    if (route && route.coords && route.coords.length > 1) {
+      const latlngs = route.coords.map(([lon, lat]) => [lat, lon]);
+      const bounds  = L.latLngBounds(latlngs);
+      map.fitBounds(bounds, { paddingTopLeft: [380, 60], paddingBottomRight: [360, 60] });
+    }
+  }
+}
+
 // ── Main entry ───────────────────────────────────────────────────────────────
 async function go() {
   const src = _srcValue.trim();
@@ -370,9 +666,6 @@ async function go() {
   clearMap();
   disruptionsLoaded  = false;
   lastDisruptionData = null;
-
-  // Keep metro overlay visible while routing
-  if (currentMode === 'metro') loadMetroOverlay();
 
   renderLoading(src, dst, currentMode);
 
@@ -407,9 +700,23 @@ async function go() {
 
   // Metro-only: no disruption analysis needed — show journey detail immediately
   if (currentMode === 'metro' && !isMetroCombo) {
-    const comboLabels = { 'metro+walk': 'Metro+Walk', 'metro+bike': 'Metro+Bike', 'metro+drive': 'Metro+Drive' };
+    const comboLabels = {
+      'metro+walk':       'Metro+Walk',
+      'metro+bike':       'Metro+Bike',
+      'metro+drive':      'Metro+Drive',
+      'metro+walk+drive': 'Walk+Metro+Cab',
+    };
     const modeStr = comboLabels[currentComboMode] || 'Metro';
     setStatus(`${src} → ${dst} · ${modeStr} route`);
+    return;
+  }
+
+  // Bus: no disruption analysis — routes are stop-based, show immediately
+  if (currentMode === 'bus') {
+    setStatus(`${src} → ${dst} · Bus route`);
+    renderPanel(currentRoutes, [], true, null, src, dst);
+    // Restore stop markers so user can see nearby stops alongside their route
+    if (_busNetwork) drawBusStopsOnly(_busNetwork.stops);
     return;
   }
 
@@ -566,30 +873,132 @@ function updateRouteColors(routes) {
 
 function drawMarkers(markers) {
   markerLayers.forEach(l => map.removeLayer(l));
+  zoneLayers.forEach(l => map.removeLayer(l));
   markerLayers = [];
-  markers.forEach(m => {
-    if (!m.lat || !m.lon) return;
-    const mk = L.circleMarker([m.lat, m.lon], {
-      radius: 8, color: '#fff', weight: 1.5,
-      fillColor: m.color || '#ea4335', fillOpacity: 0.9,
+  zoneLayers   = [];
+
+  // ── Group markers by severity for zone drawing ────────────────────────────
+  const withCoords = markers.filter(m => m.lat && m.lon);
+
+  // Draw area zones first (underneath markers)
+  withCoords.forEach(m => {
+    const sev   = m.severity || 'low';
+    const zc    = ZONE_COLOR[sev] || ZONE_COLOR.low;
+    const zr    = ZONE_RADIUS[sev] || 220;
+
+    // Outer glow circle (large, very transparent)
+    const glow = L.circle([m.lat, m.lon], {
+      radius:      zr * 2.2,
+      color:       zc.fill,
+      weight:      0,
+      fillColor:   zc.fill,
+      fillOpacity: 0.06,
+      interactive: false,
     }).addTo(map);
-    mk.bindPopup(
-      `<b>${m.event_type.replace(/_/g, ' ').toUpperCase()}</b><br>` +
-      `📍 ${m.location}<br>${m.reason}<br>` +
-      `<small>${m.age_label} · ${m.source}</small>`
+    zoneLayers.push(glow);
+
+    // Main zone circle
+    const zone = L.circle([m.lat, m.lon], {
+      radius:      zr,
+      color:       zc.stroke,
+      weight:      1.2,
+      opacity:     0.5,
+      fillColor:   zc.fill,
+      fillOpacity: 0.18,
+      dashArray:   sev === 'high' ? null : '4 3',
+    }).addTo(map);
+
+    zone.bindTooltip(
+      `<b style="color:${zc.fill}">${sev.toUpperCase()} — ${m.event_type.replace(/_/g,' ')}</b><br>` +
+      `📍 ${m.location}`,
+      { sticky: true, opacity: 0.95 }
     );
+    zoneLayers.push(zone);
+  });
+
+  // Draw point markers on top of zones
+  withCoords.forEach(m => {
+    const sev  = m.severity || 'low';
+    const zc   = ZONE_COLOR[sev] || ZONE_COLOR.low;
+    const icon = { accident:'💥', congestion:'🚗', road_closure:'🚧',
+                   construction:'🏗️', protest:'✊', weather:'🌧️',
+                   waterlogging:'💧', vip_movement:'🚨', metro_disruption:'🚇',
+                   train_delay:'🚂', transport_strike:'✋', diversion:'↪️' };
+    const emoji = icon[m.event_type] || '⚠️';
+
+    // Pulse ring for high severity
+    if (sev === 'high') {
+      const pulse = L.circleMarker([m.lat, m.lon], {
+        radius: 14, color: zc.fill, weight: 2,
+        fillColor: 'transparent', fillOpacity: 0, opacity: 0.4,
+        className: 'pulse-ring',
+      }).addTo(map);
+      zoneLayers.push(pulse);
+    }
+
+    // Emoji icon marker
+    const mk = L.marker([m.lat, m.lon], {
+      icon: L.divIcon({
+        html: `
+          <div style="
+            background:${zc.fill};
+            border:2px solid ${zc.stroke};
+            border-radius:50%;
+            width:28px;height:28px;
+            display:flex;align-items:center;justify-content:center;
+            font-size:14px;
+            box-shadow:0 2px 6px rgba(0,0,0,0.35);
+            cursor:pointer;
+          ">${emoji}</div>`,
+        className: '',
+        iconSize:   [28, 28],
+        iconAnchor: [14, 14],
+      }),
+    }).addTo(map);
+
+    const srcLabel = m.source === 'tomtom_traffic' ? '📡 TomTom Live'
+                   : m.source === 'newsapi'         ? '📰 NewsAPI'
+                   :                                  '📡 RSS';
+    const dur = m.duration ? ` · ${m.duration}` : '';
+    const urlLink = m.tomtom_url
+      ? `<br><a href="${m.tomtom_url}" target="_blank" style="font-size:10px;color:#1a73e8">View on TomTom ↗</a>`
+      : '';
+
+    mk.bindPopup(`
+      <div style="min-width:180px">
+        <div style="font-weight:700;color:${zc.fill};margin-bottom:4px">
+          ${emoji} ${m.event_type.replace(/_/g,' ').toUpperCase()}
+          ${m.is_future ? ' <span style="background:#e8f0fe;color:#1a73e8;padding:1px 5px;border-radius:8px;font-size:10px">Upcoming</span>' : ''}
+        </div>
+        <div style="font-size:12px;margin-bottom:3px">📍 <b>${m.location}</b></div>
+        <div style="font-size:12px;color:#3c4043;margin-bottom:5px">${m.reason}</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="background:${zc.fill}22;color:${zc.fill};padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600">
+            ${sev.toUpperCase()}
+          </span>
+          <span style="font-size:10px;color:#5f6368">${m.age_label}${dur}</span>
+        </div>
+        <div style="font-size:10px;color:#5f6368;margin-top:4px">${srcLabel}${urlLink}</div>
+      </div>
+    `, { maxWidth: 260 });
+
     markerLayers.push(mk);
   });
+
+  // ── Draw disruption zone legend ───────────────────────────────────────────
+  _updateZoneLegend(withCoords);
 }
 
 // ── Panel rendering ───────────────────────────────────────────────────────────
 function renderLoading(src, dst, mode) {
   const comboLabels = {
-    'metro+walk':  '🚇+🚶 Metro+Walk',
-    'metro+bike':  '🚇+🚲 Metro+Bike',
-    'metro+drive': '🚇+🚗 Metro+Drive',
+    'metro+walk':       '🚇+🚶 Metro+Walk',
+    'metro+bike':       '🚇+🚲 Metro+Bike',
+    'metro+drive':      '🚇+🚗 Metro+Drive',
+    'metro+walk+drive': '🚶+🚇+🚕 Walk+Metro+Cab',
+    'bus':              '🚌 Bus',
   };
-  const modeLabel = comboLabels[currentComboMode] || MODE_LABEL[mode] || mode;
+  const modeLabel = comboLabels[currentComboMode] || comboLabels[mode] || MODE_LABEL[mode] || mode;
   document.getElementById('panel').innerHTML = `
     <div class="sec-lbl">${modeLabel} Routes</div>
     <div class="loading-row">
@@ -606,14 +1015,18 @@ function renderError(msg) {
 function renderPanel(routes, markers, ready, weather, src, dst) {
   const mode  = currentComboMode || currentMode;
   const comboLabels = {
-    'metro+walk':  '🚇+🚶 Metro+Walk',
-    'metro+bike':  '🚇+🚲 Metro+Bike',
-    'metro+drive': '🚇+🚗 Metro+Drive',
+    'metro+walk':       '🚇+🚶 Metro+Walk',
+    'metro+bike':       '🚇+🚲 Metro+Bike',
+    'metro+drive':      '🚇+🚗 Metro+Drive',
+    'metro+walk+drive': '🚶+🚇+🚕 Walk+Metro+Cab',
+    'bus':              '🚌 Bus',
   };
   const mLabel = comboLabels[mode] || MODE_LABEL[currentMode] || currentMode;
 
   let html = '';
-  const note = (ready || mode === 'metro')
+  const isPureBus   = mode === 'bus';
+  const isPureMetro = mode === 'metro';
+  const note = (ready || isPureMetro || isPureBus)
     ? ''
     : ' <span style="font-size:10px;font-weight:400;text-transform:none;letter-spacing:0;color:#9aa0a6">— analysing…</span>';
 
@@ -623,14 +1036,13 @@ function renderPanel(routes, markers, ready, weather, src, dst) {
     html += buildRouteCard(r, i, ready, markers, mode);
   });
 
-  // Weather banner — only relevant for drive/bike (not metro/walk)
+  // Weather banner — only relevant for drive/bike (not metro/walk/bus)
   if (ready && weather && (mode === 'drive' || mode === 'bike')) {
     html += buildWeatherBanner(weather);
   }
 
-  // Disruption loading row — skip for pure metro (no disruption analysis),
-  // but show for metro+walk/bike/drive combos which do run disruption analysis.
-  if (!ready && mode !== 'metro') {
+  // Disruption loading row — skip for pure metro and bus (no disruption analysis)
+  if (!ready && mode !== 'metro' && mode !== 'bus') {
     html += `
     <div class="divider"></div>
     <div class="loading-row">
@@ -655,12 +1067,17 @@ function buildRouteCard(r, i, ready, markers, mode) {
   // Pure metro: no disruption analysis — just label it
   // Metro combos (metro+walk/bike/drive): DO run disruption analysis, show results
   // Walk: show as walking route (low relevance for disruptions)
+  // Bus: no disruption analysis — label it
   let evtClass = '', evtIcon = '', evtText = '';
   const isPureMetro  = mode === 'metro';
-  const isMetroCombo = mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive';
+  const isPureBus    = mode === 'bus';
+  const isMetroCombo = mode === 'metro+walk' || mode === 'metro+bike' || mode === 'metro+drive' || mode === 'metro+walk+drive';
   if (isPureMetro) {
     evtClass = 'ok'; evtIcon = '✓';
     evtText  = 'Metro route';
+  } else if (isPureBus) {
+    evtClass = 'ok'; evtIcon = '✓';
+    evtText  = 'Bus route';
   } else if (mode === 'walk') {
     evtClass = 'ok'; evtIcon = '✓'; evtText = 'Walking route';
   } else if (!ready) {
@@ -668,19 +1085,38 @@ function buildRouteCard(r, i, ready, markers, mode) {
   } else if (evtCount === 0) {
     evtClass = 'ok'; evtIcon = '✓'; evtText = 'No disruptions';
   } else if (riskLevel === 'HIGH' || riskLevel === 'CRITICAL') {
-    evtClass = 'critical'; evtIcon = '⛔'; evtText = `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
+    const specific = r.route_specific_events || 0;
+    const area     = r.area_wide_events || 0;
+    evtClass = 'critical'; evtIcon = '⛔';
+    evtText  = specific > 0
+      ? `${specific} on route · ${area} area-wide`
+      : `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
   } else {
-    evtClass = 'warn'; evtIcon = '⚠'; evtText = `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
+    const specific = r.route_specific_events || 0;
+    const area     = r.area_wide_events || 0;
+    evtClass = 'warn'; evtIcon = '⚠';
+    evtText  = specific > 0
+      ? `${specific} on route · ${area} area-wide`
+      : `${evtCount} disruption${evtCount > 1 ? 's' : ''}`;
   }
 
   // Subtitle
   let subtitle = '';
   if ((isPureMetro || isMetroCombo) && r.segments) {
     const metro = r.segments.find(s => s.type === 'metro');
-    const feederLabel = isMetroCombo
-      ? mode.split('+')[1].charAt(0).toUpperCase() + mode.split('+')[1].slice(1)
-      : 'Walk';
-    subtitle = metro ? `${metro.from} → ${metro.to}` : `Metro + ${feederLabel}`;
+    let comboSubtitle;
+    if (mode === 'metro+walk+drive') {
+      comboSubtitle = 'Walk → Metro → Cab';
+    } else {
+      const feederPart = mode.split('+')[1] || 'walk';
+      const feederLabel = feederPart.charAt(0).toUpperCase() + feederPart.slice(1);
+      comboSubtitle = `Metro + ${feederLabel}`;
+    }
+    subtitle = metro ? `${metro.from} → ${metro.to}` : comboSubtitle;
+  } else if (isPureBus) {
+    subtitle = r.src_stop && r.dst_stop
+      ? `${r.src_stop} → ${r.dst_stop}`
+      : 'via bus stops';
   } else {
     subtitle = 'via ' + ((r.road_names || []).slice(0, 2).join(', ') || 'city roads');
   }
@@ -698,7 +1134,7 @@ function buildRouteCard(r, i, ready, markers, mode) {
         <div class="rc-subtitle">${subtitle}</div>
       </div>
       ${isBest ? '<div class="best-badge">Best</div>' : ''}
-      ${(ready && riskLevel && !isPureMetro)
+      ${(ready && riskLevel && !isPureMetro && !isPureBus)
         ? `<div class="risk-pill" style="background:${riskColor}18;color:${riskColor}">${riskLevel}</div>`
         : ''}
     </div>
@@ -706,21 +1142,95 @@ function buildRouteCard(r, i, ready, markers, mode) {
     <div class="rc-stats">
       <div class="stat-chip">${r.travel_time_min}<span class="lbl"> min</span></div>
       <div class="stat-chip">${r.distance_km}<span class="lbl"> km</span></div>
-      ${(ready && riskLevel && !isPureMetro)
+      ${(ready && riskLevel && !isPureMetro && !isPureBus)
         ? `<div class="stat-chip" style="color:${riskColor}">${r.risk_score || 0}<span class="lbl" style="color:${riskColor}99"> risk</span></div>`
+        : ''}
+      ${isPureBus && r.num_stops != null
+        ? `<div class="stat-chip">${r.num_stops}<span class="lbl"> stops</span></div>`
         : ''}
     </div>
 
-    ${!isPureMetro ? `<div class="rc-roads">${roadsText}</div>` : ''}
+    ${(!isPureMetro && !isPureBus) ? `<div class="rc-roads">${roadsText}</div>` : ''}
     <div class="rc-events ${evtClass}">${evtIcon} ${evtText}</div>`;
 
   // Expanded detail for the active card
   if (isActive) {
     if (isPureMetro || isMetroCombo) {
       html += buildMetroJourney(r);
+    } else if (isPureBus) {
+      html += buildBusJourney(r);
     } else {
       html += buildExpandedDetail(r, ready);
     }
+  }
+
+  html += '</div>';
+  return html;
+}
+
+// ── Bus journey breakdown ─────────────────────────────────────────────────────
+function buildBusJourney(r) {
+  const segments  = r.segments  || [];
+  const busStops  = r.bus_stops || [];
+  const matchingRoutes = r.matching_routes || [];
+
+  let html = '<div class="metro-journey">';
+  html += '<div class="expand-sec">Journey Breakdown</div>';
+
+  // Matching bus route numbers badge row
+  if (matchingRoutes.length) {
+    const badges = matchingRoutes.slice(0, 3).map(rt =>
+      `<span style="
+        background:#FF572222;color:#FF5722;
+        border:1px solid #FF572244;
+        border-radius:6px;padding:2px 8px;
+        font-size:11px;font-weight:600;
+        margin-right:4px">
+        🚌 ${rt.route_name}
+      </span>`
+    ).join('');
+    html += `<div style="margin:4px 0 8px;display:flex;flex-wrap:wrap;gap:2px">${badges}</div>`;
+  }
+
+  // Stop-by-stop list
+  if (segments.length) {
+    const total = segments.length;
+    segments.forEach((seg, i) => {
+      const isFirst = seg.is_first || i === 0;
+      const isLast  = seg.is_last  || i === total - 1;
+      const dot     = isFirst ? 'node-dot-start' : isLast ? 'node-dot-end' : 'node-dot-mid';
+      html += `
+      <div class="road-node-row">
+        <div class="node-track">
+          <div class="node-dot ${dot}" style="${isFirst || isLast ? 'background:#FF5722' : ''}"></div>
+          ${!isLast ? '<div class="node-line" style="background:#FF572244"></div>' : ''}
+        </div>
+        <div class="node-label">
+          ${isFirst ? '<b>' : ''}${seg.name}${isFirst ? '</b>' : ''}
+          ${isFirst  ? ' <span style="font-size:10px;color:#FF5722;font-weight:600">Board</span>'  : ''}
+          ${isLast   ? ' <span style="font-size:10px;color:#FF5722;font-weight:600">Alight</span>' : ''}
+        </div>
+      </div>`;
+    });
+  } else if (busStops.length) {
+    // Fallback: plain stop-name list
+    busStops.forEach((name, i) => {
+      const isFirst = i === 0, isLast = i === busStops.length - 1;
+      const dot = isFirst ? 'node-dot-start' : isLast ? 'node-dot-end' : 'node-dot-mid';
+      html += `
+      <div class="road-node-row">
+        <div class="node-track">
+          <div class="node-dot ${dot}" style="${isFirst || isLast ? 'background:#FF5722' : ''}"></div>
+          ${!isLast ? '<div class="node-line"></div>' : ''}
+        </div>
+        <div class="node-label">${name}</div>
+      </div>`;
+    });
+  }
+
+  // bus_note (e.g. "no direct route" fallback message)
+  if (r.bus_note) {
+    html += `<div class="metro-note-banner">${r.bus_note}</div>`;
   }
 
   html += '</div>';
@@ -742,7 +1252,7 @@ function buildMetroJourney(r) {
 
   segments.forEach((seg, i) => {
     const isMetro = seg.type === 'metro';
-    const icon = isMetro ? '🚇' : (seg.type === 'bike' ? '🚲' : seg.type === 'drive' ? '🚗' : '🚶');
+    const icon = isMetro ? '🚇' : (seg.type === 'bike' ? '🚲' : seg.type === 'drive' ? '🚕' : '🚶');
     const lineClass = isMetro
       ? `<span class="metro-line-pill ${seg.line || 'blue'}">${(seg.line || 'blue').toUpperCase()} LINE</span>`
       : '';
@@ -768,7 +1278,15 @@ function buildMetroJourney(r) {
       }
     } else {
       detail = `${seg.from} → ${seg.to} · ${seg.distance_km} km`;
+      if (seg.cab_note) {
+        detail += `<br><small style="color:#1a73e8">🚕 ${seg.cab_note}</small>`;
+      }
     }
+
+    const segTypeLabel = isMetro ? 'Metro'
+      : seg.type === 'bike'  ? 'Bike'
+      : seg.type === 'drive' ? 'Cab / Drive'
+      : 'Walk';
 
     html += `
     <div class="journey-seg">
@@ -777,7 +1295,7 @@ function buildMetroJourney(r) {
         ${!isLast(i) ? `<div class="seg-connector ${seg.type}"></div>` : ''}
       </div>
       <div class="seg-body">
-        <div class="seg-title">${isMetro ? 'Metro' : (seg.type === 'bike' ? 'Bike' : seg.type === 'drive' ? 'Drive' : 'Walk')} ${lineClass}</div>
+        <div class="seg-title">${segTypeLabel} ${lineClass}</div>
         <div class="seg-detail">${detail}</div>
         <div class="seg-time-chip">${seg.time_min} min · ${seg.distance_km} km</div>
       </div>
@@ -834,15 +1352,42 @@ function buildExpandedDetail(r, ready) {
   }
 
   if (ready) {
-    const active = (r.matched_events || []).filter(e => !e.is_future_event);
-    const future = (r.matched_events || []).filter(e =>  e.is_future_event);
+    const allActive = (r.matched_events || []).filter(e => !e.is_future_event);
+    const future    = (r.matched_events || []).filter(e =>  e.is_future_event);
 
-    html += `<div class="expand-sec">Disruptions on this Route (${active.length})</div>`;
-    if (active.length === 0) {
+    // Split into route-specific and area-wide
+    const specific  = allActive.filter(e => e.route_specific);
+    const areaWide  = allActive.filter(e => !e.route_specific);
+
+    if (allActive.length === 0) {
+      html += '<div class="expand-sec">Disruptions on this Route (0)</div>';
       html += '<div class="expand-clear">✓ No active disruptions</div>';
     } else {
-      active.forEach(ev => { html += buildEventCard(ev); });
+      // Route-specific disruptions
+      if (specific.length > 0) {
+        html += `
+        <div class="expand-sec">
+          On This Route
+          <span class="sec-badge specific">${specific.length}</span>
+        </div>`;
+        specific.forEach(ev => { html += buildEventCard(ev); });
+      }
+
+      // Area-wide disruptions (collapsible)
+      if (areaWide.length > 0) {
+        const areaId = `area-${r.id || Math.random()}`;
+        html += `
+        <div class="expand-sec area-sec" onclick="toggleAreaEvents('${areaId}')">
+          Area-wide (affect all routes)
+          <span class="sec-badge area">${areaWide.length}</span>
+          <span class="area-toggle" id="tog-${areaId}">▼</span>
+        </div>
+        <div id="${areaId}" class="area-events-list">`;
+        areaWide.forEach(ev => { html += buildEventCard(ev, false, true); });
+        html += '</div>';
+      }
     }
+
     if (future.length > 0) {
       html += `<div class="expand-sec">Upcoming (${future.length})</div>`;
       future.forEach(ev => { html += buildEventCard(ev, true); });
@@ -859,15 +1404,26 @@ function buildExpandedDetail(r, ready) {
   return html;
 }
 
-function buildEventCard(ev, isFuture = false) {
+function toggleAreaEvents(id) {
+  const el  = document.getElementById(id);
+  const tog = document.getElementById('tog-' + id);
+  if (!el) return;
+  const hidden = el.style.display === 'none' || el.style.display === '';
+  el.style.display   = hidden ? 'block' : 'none';
+  if (tog) tog.textContent = hidden ? '▲' : '▼';
+}
+
+function buildEventCard(ev, isFuture = false, isAreaWide = false) {
   const isLive = ev.source === 'tomtom_traffic';
   const dur    = ev.impact_duration_label ? ` · ${ev.impact_duration_label}` : '';
   const src    = isLive ? '📡 TomTom Live' : ev.source === 'newsapi' ? '📰 NewsAPI' : '📡 RSS';
-  const ftag   = isFuture ? '<span class="future-tag">Upcoming</span>' : '';
+  const ftag   = isFuture  ? '<span class="future-tag">Upcoming</span>' : '';
+  const atag   = isAreaWide ? '<span class="area-tag">Area-wide</span>'  : '';
+  const corrTag = ev.severity_corrected ? '<span class="hgnn-tag">HGNN ✓</span>' : '';
   return `
-  <div class="ev-item ${ev.severity}">
+  <div class="ev-item ${ev.severity} ${isAreaWide ? 'area-wide-ev' : ''}">
     <div class="ev-head">
-      <span class="ev-type" style="color:${ev.color || '#5f6368'}">${ev.event_type.replace(/_/g, ' ')}${ftag}</span>
+      <span class="ev-type" style="color:${ev.color || '#5f6368'}">${ev.event_type.replace(/_/g, ' ')}${ftag}${atag}${corrTag}</span>
       <span class="ev-age">${ev.age_label || ''}</span>
     </div>
     <div class="ev-loc">📍 ${ev.location}</div>
@@ -936,7 +1492,13 @@ function clearMap() {
   routeLayers.forEach(l => map.removeLayer(l));
   pinLayers.forEach(l => map.removeLayer(l));
   markerLayers.forEach(l => map.removeLayer(l));
-  routeLayers = []; pinLayers = []; markerLayers = [];
+  zoneLayers.forEach(l => map.removeLayer(l));
+  routeLayers = []; pinLayers = []; markerLayers = []; zoneLayers = [];
+  // Also clear bus stop overlay when a route search starts
+  clearBusOverlay();
+  // Remove zone legend
+  const leg = document.getElementById('zone-legend');
+  if (leg) leg.remove();
 }
 
 function pin(emoji) {
@@ -961,5 +1523,44 @@ function toast(msg) {
   setTimeout(() => t.style.display = 'none', 3500);
 }
 
+// ── Disruption zone legend ────────────────────────────────────────────────────
+function _updateZoneLegend(markers) {
+  // Remove old legend
+  const old = document.getElementById('zone-legend');
+  if (old) old.remove();
+
+  if (!markers || markers.length === 0) return;
+
+  const counts = { high: 0, medium: 0, low: 0 };
+  markers.forEach(m => {
+    const s = m.severity || 'low';
+    if (counts[s] !== undefined) counts[s]++;
+  });
+
+  const rows = Object.entries(counts)
+    .filter(([, c]) => c > 0)
+    .map(([sev, cnt]) => {
+      const zc = ZONE_COLOR[sev] || ZONE_COLOR.low;
+      return `
+      <div class="zleg-row">
+        <div class="zleg-swatch" style="background:${zc.fill};border:1.5px solid ${zc.stroke}"></div>
+        <span>${sev.charAt(0).toUpperCase()+sev.slice(1)}</span>
+        <span class="zleg-count">${cnt}</span>
+      </div>`;
+    }).join('');
+
+  const leg = document.createElement('div');
+  leg.id        = 'zone-legend';
+  leg.className = 'zone-legend';
+  leg.innerHTML = `
+    <div class="zleg-title">Disruption Zones</div>
+    ${rows}
+    <div class="zleg-note">Radius = severity</div>
+  `;
+  document.body.appendChild(leg);
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────────────
 loadLocations();
+loadMetroOverlay();
+document.getElementById('map-legend').classList.add('visible');

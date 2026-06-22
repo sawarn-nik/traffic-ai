@@ -25,6 +25,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from llm.prompts import TRAFFIC_PROMPT
 from llm.schema import TrafficEventSchema, EventType, Severity, LocationSource
 from config import (
+    LLM_BACKEND,
     OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL,
     GEMINI_API_KEY, GEMINI_MODEL,
 )
@@ -35,17 +36,25 @@ BASE_DELAY       = 60.0    # seconds to wait after first 429 (OpenRouter needs 6
 BACKOFF_FACTOR   = 2.0     # delay doubles each retry: 60s → 120s → 240s
 JITTER_RANGE     = 5.0     # add ±5s random jitter to avoid thundering-herd
 
-# OpenRouter free tier actual observed limit: ~4 req/min under sustained load.
-# Measuring from END of previous call, 15s gap = safe at 4 req/min.
-MIN_CALL_INTERVAL = 15.0   # seconds to wait AFTER each LLM call completes
+# OpenRouter free tier: ~4 req/min → 15s gap is safe.
+# Gemini free tier (gemini-1.5-flash): 15 req/min → 4s gap is safe.
+# The interval is set conservatively for OpenRouter; Gemini will naturally run faster.
+MIN_CALL_INTERVAL = 5.0    # seconds to wait AFTER each LLM call completes
 
-# Global LLM call budget: cap total LLM calls per pipeline run to avoid
-# exhausting the per-minute quota across many articles in one session.
-# TomTom/HERE articles don't count (they skip the LLM entirely).
-MAX_LLM_CALLS_PER_RUN = 20   # ~5 min of quota at 4 req/min
+# Global LLM call budget: cap total LLM calls per pipeline run.
+# Raised to 50 to handle a typical 54-article batch (TomTom/HERE skip LLM entirely).
+MAX_LLM_CALLS_PER_RUN = 50
 
 _last_call_end_time: float = 0.0   # time when the last call FINISHED
 _llm_call_count: int = 0           # total LLM calls made this run
+
+
+def reset_llm_budget() -> None:
+    """Reset the per-run LLM call counter. Call once at the start of each
+    /api/disruptions request so the budget is per-request, not per-process."""
+    global _llm_call_count
+    _llm_call_count = 0
+
 
 # ── Shared parser ─────────────────────────────────────────────────────────────
 _parser = PydanticOutputParser(pydantic_object=TrafficEventSchema)
@@ -198,7 +207,7 @@ def _build_openrouter_model():
         openai_api_key=OPENROUTER_API_KEY,
         openai_api_base=OPENROUTER_BASE_URL,
         temperature=0.1,
-        max_tokens=512,
+        max_tokens=1024,
         default_headers={"X-Title": "traffic-ai-layer1"},
     )
 
@@ -213,16 +222,36 @@ def _build_gemini_model():
 
 
 def _get_model():
+    backend = LLM_BACKEND.lower()
+
+    if backend == "gemini":
+        if GEMINI_API_KEY:
+            try:
+                return _build_gemini_model()
+            except Exception as e:
+                print(f"[Extractor] Gemini init failed: {e}")
+        print("[Extractor] Gemini unavailable — falling back to OpenRouter")
+
+    if backend == "ollama":
+        try:
+            from langchain_ollama import ChatOllama
+            from config import OLLAMA_MODEL
+            return ChatOllama(model=OLLAMA_MODEL)
+        except Exception as e:
+            print(f"[Extractor] Ollama init failed: {e}")
+        print("[Extractor] Ollama unavailable — falling back to OpenRouter")
+
+    # default: openrouter (or fallback from above)
     if OPENROUTER_API_KEY:
         try:
             return _build_openrouter_model()
         except Exception as e:
             print(f"[Extractor] OpenRouter init failed: {e}")
-    if GEMINI_API_KEY:
+    if GEMINI_API_KEY and backend != "gemini":
         try:
             return _build_gemini_model()
         except Exception as e:
-            print(f"[Extractor] Gemini init failed: {e}")
+            print(f"[Extractor] Gemini fallback init failed: {e}")
     raise RuntimeError(
         "No LLM backend available. "
         "Set OPENROUTER_API_KEY or GEMINI_API_KEY in your .env file."
@@ -294,16 +323,18 @@ def _pace_call() -> None:
     """
     Wait until MIN_CALL_INTERVAL seconds have passed since the LAST CALL ENDED.
 
-    Measuring from end-of-call (not start) ensures the full gap is respected
-    regardless of how long the model takes to respond.
+    Interval is adjusted per-backend:
+      - OpenRouter free tier: ~4 req/min → 15s gap
+      - Gemini free tier:     ~15 req/min → 5s gap
     """
     global _last_call_end_time
+    # Use a longer interval for OpenRouter to stay under its stricter limit
+    interval = 15.0 if LLM_BACKEND.lower() == "openrouter" else MIN_CALL_INTERVAL
     now     = time.monotonic()
     elapsed = now - _last_call_end_time
-    if elapsed < MIN_CALL_INTERVAL:
-        wait = MIN_CALL_INTERVAL - elapsed
+    if elapsed < interval:
+        wait = interval - elapsed
         time.sleep(wait)
-    # Note: _last_call_end_time is updated AFTER the call returns (see extract_event)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -349,6 +380,14 @@ def extract_event(
                 return result
 
     # ── LLM extraction for unstructured text sources ──────────────────────────
+    # Check global call budget before attempting any LLM call.
+    # TomTom/HERE direct extractions above don't count against this budget.
+    global _llm_call_count
+    if _llm_call_count >= MAX_LLM_CALLS_PER_RUN:
+        print(f"[Extractor] LLM budget exhausted ({MAX_LLM_CALLS_PER_RUN} calls) "
+              f"— skipping remaining articles this run.")
+        return None
+
     _current_text = text
     primary, fallback = _get_chains()
     payload = {
@@ -363,7 +402,8 @@ def extract_event(
 
         try:
             result = primary.invoke(payload)
-            _last_call_end_time = time.monotonic()   # record end time on success
+            _last_call_end_time = time.monotonic()
+            _llm_call_count += 1   # count successful call against budget
             if result is None:
                 raise ValueError("Primary chain returned None — trying fallback")
             return result
@@ -379,6 +419,7 @@ def extract_event(
                     _pace_call()
                     result = fallback.invoke(payload)
                     _last_call_end_time = time.monotonic()
+                    _llm_call_count += 1
                     if result is not None:
                         return result
                 except Exception as fe:
