@@ -1,4 +1,4 @@
-# traffic-ai 🚦
+# UrbanMind 🚦
 
 **A Probabilistic and Explainable Tool for Context-Aware Multimodal Trip Planning Using Generative AI**
 
