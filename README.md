@@ -1,8 +1,6 @@
 # UrbanMind 🚦
 
 **A Probabilistic and Explainable Tool for Context-Aware Multimodal Trip Planning Using Generative AI**
-
-Research prototype — ANRF ARG grant proposal, IIT Kharagpur.  
 Pilot city: **Kolkata, India** | Collaboration with Kolkata Traffic Police.
 
 ---
@@ -298,7 +296,7 @@ All settings are read from `.env` (copy from `.env.example`).
 ## Research context
 
 > *A Probabilistic and Explainable Tool for Context-Aware Multimodal Trip Planning Using Generative Artificial Intelligence (GenAI)*  
-> ANRF ARG Pre-Proposal, IIT Kharagpur, 2026
+
 
 ---
 
