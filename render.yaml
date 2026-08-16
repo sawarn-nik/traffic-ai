@@ -40,9 +40,10 @@ services:
       - key: MIN_ROUTE_DIVERGENCE
         value: "0.20"
 
-      # ── Database — use /data (persistent disk mount point) ─────────────────
+      # ── Database — stored inside the container (free tier has no persistent disk)
+      # Note: DB resets on each redeploy, which is fine — it's a runtime event cache
       - key: DATABASE_URL
-        value: sqlite:////data/traffic_events.db
+        value: sqlite:///traffic_events.db
 
       # ── Graph cache path — baked into image at /app/cache/ ────────────────
       - key: GRAPH_CACHE_PATH
@@ -61,13 +62,6 @@ services:
         value: "true"
       - key: ENABLE_NOMINATIM
         value: "true"
-
-    # Persistent disk — keeps SQLite DB across deploys and restarts
-    # Free tier includes 1 GB persistent disk
-    disk:
-      name: traffic-ai-data
-      mountPath: /data
-      sizeGB: 1
 
     # Health check — Render uses this to know when the app is ready
     healthCheckPath: /health
